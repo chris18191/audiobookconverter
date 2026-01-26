@@ -76,7 +76,7 @@ func main() {
 		// Every output folder has to contain the original epub file in order to be recognized
 		files, err = traverseAndFindEpub(FOLDER_OUT)
 		if err != nil {
-			fmt.Printf("Failed to traverse output folder '%s': %s\n", FOLDER_IN, err)
+			fmt.Printf("Failed to traverse output folder '%s': %s\n", FOLDER_OUT, err)
 		}
 		fmt.Println("Found following epubs as output: ", files)
 		parseAndAddBooks(&books, files, false)
@@ -285,7 +285,8 @@ func runAudiblezOnEpub(book Book) (string, error) {
 	tmp, _ := io.ReadAll(stder)
 	// Wait for the command to finish
 	if err := cmd.Wait(); err != nil {
-		log.Fatalf("Command finished with error: %v\n#### OUTPUT ####\n%s", err, tmp)
+		log.Printf("Command finished with error: %v\n#### OUTPUT ####\n%s", err, tmp)
+		log.Printf("Epub will be copied to prevent future retries.")
 	}
 
 	os.Rename(filepath.Join(tmpPath, "book.epub"), filepath.Join(tmpPath, book.BookName))
