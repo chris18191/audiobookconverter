@@ -7,6 +7,7 @@ RUN apt install -y golang
 
 WORKDIR /converter
 COPY . /converter
+RUN go mod tidy
 RUN go build .
 RUN ls
 RUN cp /converter/audiobookconverter /opt/
