@@ -5,10 +5,11 @@ RUN apt install -y ffmpeg espeak-ng
 RUN pip install audiblez 
 RUN apt install golang
 
-COPY . /converter
 WORKDIR /converter
+COPY . /converter
 RUN go build .
-COPY ./audiobookconverter /opt/
+RUN ls
+RUN cp /converter/audiobookconverter /opt/
 WORKDIR /opt/
 RUN rm -rf /converter
 
