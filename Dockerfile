@@ -3,7 +3,7 @@ FROM python:3.12-slim-bookworm
 RUN apt update
 RUN apt install -y ffmpeg espeak-ng
 RUN pip install audiblez 
-RUN apt install golang
+RUN apt install -y golang
 
 WORKDIR /converter
 COPY . /converter
