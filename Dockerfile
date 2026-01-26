@@ -8,8 +8,8 @@ RUN apt install -y golang
 WORKDIR /converter
 COPY . /converter
 RUN go install golang.org/dl/go1.25.6@latest
-RUN go mod tidy
-RUN go build .
+RUN go1.25.6 mod tidy
+RUN go1.25.6 build .
 RUN ls
 RUN cp /converter/audiobookconverter /opt/
 WORKDIR /opt/
