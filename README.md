@@ -90,6 +90,24 @@ docker run -d --name audiobookconverter \
 
 The cache volume keeps the voice model across container restarts.
 
+### One book at a time
+
+`convert-epub.sh` starts a container for a single epub instead of watching a
+folder, shows the conversion log, and exits when the book is done:
+
+```bash
+./convert-epub.sh ~/Books/"The Secret Name.epub"
+./convert-epub.sh -o ~/Audiobooks -v bmGeorge --bitrate 128k ~/Books/*.epub
+```
+
+The audiobooks appear in the output folder (`.` by default), one subfolder per
+book. The voice model is kept in the `audiobookconverter-models` docker volume,
+so it is downloaded once. A book whose folder in the output already holds its
+epub is reported as converted and left alone. `--help` lists the options,
+`--dry-run` prints the `docker run` command instead of running it, `--build`
+builds the image first. The files are written by root inside the container, so
+they may be owned by root on the host.
+
 ## Development
 
 ```bash
