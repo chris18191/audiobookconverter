@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/zip"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -173,6 +176,100 @@ func TestDerivedEpubKeepsRelativeHrefs(t *testing.T) {
 	}
 	if derived.coverID == "" {
 		t.Errorf("derived epub lost its cover")
+	}
+}
+
+// TestChaptersOutsideThePackageDirectory covers books whose content lives in a
+// directory next to the one holding content.opf (a "Text/" folder beside
+// "OEBPS/"): the hrefs of those documents start with "..".
+func TestChaptersOutsideThePackageDirectory(t *testing.T) {
+	dir := t.TempDir()
+	src := writeFixtureEpub(t, filepath.Join(dir, "src", "Book.epub"), true)
+	flat := filepath.Join(dir, "sibling.epub")
+	relocateContent(t, src, flat)
+
+	b, err := openEpub(flat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := defaultFilter(t)
+	names, want := []string{}, []string{"Chapter One", "Chapter Two"}
+	for _, ch := range b.spine {
+		if keep, _ := b.keepChapter(ch, f); keep {
+			names = append(names, ch.Title)
+		}
+	}
+	if len(names) != len(want) {
+		t.Fatalf("chapters = %v, want %v", names, want)
+	}
+
+	out := filepath.Join(dir, "derived.epub")
+	if _, err := b.writeDerivedEpub(out, b.selectedChapters(f)); err != nil {
+		t.Fatal(err)
+	}
+	// ebooklib reads the spine through the manifest hrefs: if they do not point
+	// at the entries that were written, the conversion produces silence.
+	got, err := openEpub(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.spine) != len(want) {
+		t.Fatalf("derived spine = %d documents, want %d", len(got.spine), len(want))
+	}
+	for i, ch := range got.spine {
+		if ch.ZipPath == "" || ch.charCount() < 200 {
+			t.Errorf("derived chapter %d = path %q, %d characters", i+1, ch.ZipPath, ch.charCount())
+		}
+		if !strings.Contains(ch.Title, want[i]) {
+			t.Errorf("derived chapter %d title = %q, want %q", i+1, ch.Title, want[i])
+		}
+	}
+}
+
+// relocateContent rewrites an epub so that everything but the package document
+// moves from OEBPS/ to the sibling directory Text/, adjusting the manifest hrefs
+// the way such a book does.
+func relocateContent(t *testing.T, src, dest string) {
+	t.Helper()
+	zr, err := zip.OpenReader(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	out, err := os.Create(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	zw := zip.NewWriter(out)
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := f.Name
+		if name != "OEBPS/content.opf" && strings.HasPrefix(name, "OEBPS/") {
+			name = "Text/" + strings.TrimPrefix(name, "OEBPS/")
+		}
+		if name == "OEBPS/content.opf" {
+			text := regexp.MustCompile(`href="([^"#]+)"`).ReplaceAllString(string(body), `href="../Text/$1"`)
+			body = []byte(text)
+		}
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
