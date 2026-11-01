@@ -14,8 +14,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # Three steps instead of one: when this fails, the run has to say whether the
+    # login, the build or the push was the problem. The password goes in over
+    # stdin so the token does not appear in the process list of the runner.
+    - name: Log in to ghcr.io
+      run: echo "${{ secrets.GH_PAT }}" | docker login ghcr.io -u "${{ secrets.GH_USER }}" --password-stdin
     - name: Build the Docker image
-      run: |
-          docker login --username ${{ secrets.GH_USER }} --password ${{ secrets.GH_PAT }} ghcr.io
-          docker build . --tag ghcr.io/${{ secrets.GH_USER }}/audiobookconverter:latest
-          docker push ghcr.io/${{ secrets.GH_USER }}/audiobookconverter:latest
+      run: docker build . --tag ghcr.io/${{ secrets.GH_USER }}/audiobookconverter:latest
+    - name: Push the Docker image
+      run: docker push ghcr.io/${{ secrets.GH_USER }}/audiobookconverter:latest
