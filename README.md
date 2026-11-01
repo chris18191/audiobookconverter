@@ -32,18 +32,15 @@ For each `<Book>.epub` in the input folder:
    which are irrelevant for speech synthesis).
 4. **Run audiblez** on it, so the speech synthesis order is the chapter order by
    construction.
-5. **Write one mp3 per chapter**, named `<number> - <chapter title>.mp3`, e.g.
-   `4 - 1. Origins.mp3`, and one `<Book>.m4b` holding the whole book with the
-   epub chapter titles as chapter markers.
+5. **Write one `<Book>.m4b`** holding the whole book, with the epub chapter
+   titles as chapter markers at the right offsets. No other audio file is
+   written: the chapter audio stays in the work directory.
 6. **Copy the source epub** into the book's folder in the output directory. That
    copy is the marker of a finished book: the scanner never picks it up again as
    new work.
 
 ```
 <out>/The Secret Name/
-├── 1 - An Antlered Boy.mp3
-├── 2 - A Visit to the Fair.mp3
-├── ...
 ├── The Secret Name.m4b
 └── The Secret Name.epub   <- finished marker
 ```
@@ -59,8 +56,7 @@ the input and output folders (`FOLDER_IN`, `FOLDER_OUT` still work).
 | `CONVERTER_OUT` | - | Folder the audiobooks are written to |
 | `CONVERTER_VOICE` | `bm_lewis` | audiblez voice (`audiblez --help` lists them) |
 | `CONVERTER_SPEED` | `1.0` | Speech speed, 0.5 - 2.0 |
-| `CONVERTER_BITRATE` | `192k` | Bitrate of the mp3 and m4b audio |
-| `CONVERTER_M4B` | `true` | Also write the single file `.m4b` |
+| `CONVERTER_BITRATE` | `192k` | Bitrate of the `.m4b` audio |
 | `CONVERTER_MAX_DEPTH` | `3` | How deep below `CONVERTER_IN` epubs are looked for (`-1` = unlimited) |
 | `CONVERTER_MIN_TEXT_CHARS` | `1000` | Text a document without any title needs to count as the continuation of the previous chapter |
 | `CONVERTER_EXTRA_SKIP_PATTERNS` | - | Comma separated regexps, matched against chapter titles, dropped in addition to the built-in list |

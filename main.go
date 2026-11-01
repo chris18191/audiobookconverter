@@ -91,7 +91,6 @@ type config struct {
 	MinTextChars int
 	SkipPatterns []*regexp.Regexp
 	KeepPatterns []*regexp.Regexp
-	BuildM4B     bool
 	MaxAttempts  int
 	PollInterval time.Duration
 }
@@ -199,12 +198,12 @@ func convertBook(book *Book, cfg config) error {
 	book.TimeRemaining = eta
 	if audiblezErr != nil {
 		// audiblez still writes the wav files of every chapter it managed to
-		// synthesise; the m4b step in particular fails on ffmpeg builds without
-		// libfdk_aac. Keep whatever audio exists.
+		// synthesise, and a chapter that is long enough to have taken minutes is
+		// worth keeping; whether that is the whole book is decided below.
 		log.Printf("%v - converting the wav files that were produced", audiblezErr)
 	}
 
-	audio, err := collectChapterAudio(workDir, chapters, cfg.Bitrate)
+	audio, err := collectChapters(workDir, chapters)
 	if err != nil {
 		if audiblezErr != nil {
 			return fmt.Errorf("%w (audiblez: %v)", err, audiblezErr)
@@ -226,11 +225,12 @@ func convertBook(book *Book, cfg config) error {
 	}
 	book.Chapters = len(audio)
 
-	if cfg.BuildM4B {
-		m4bName := strings.TrimSuffix(book.BookName, filepath.Ext(book.BookName)) + ".m4b"
-		if err := buildM4B(workDir, audio, epub.meta, m4bName, cfg.Bitrate); err != nil {
-			log.Printf("Could not create the single file audiobook: %v", err)
-		}
+	// The .m4b is the only audio file the converter delivers, so its failure is
+	// the book's failure: without it the output folder would hold nothing but the
+	// epub marker.
+	m4bName := strings.TrimSuffix(book.BookName, filepath.Ext(book.BookName)) + ".m4b"
+	if err := buildM4B(workDir, audio, epub.meta, m4bName, cfg.Bitrate); err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(bookFolder, 0o755); err != nil {
@@ -323,7 +323,6 @@ func defaultConfig() config {
 		Speed:        1.0,
 		Bitrate:      defaultBitrate,
 		MinTextChars: defaultMinText,
-		BuildM4B:     true,
 		MaxAttempts:  defaultMaxTry,
 		PollInterval: time.Duration(defaultPollMins) * time.Minute,
 		SkipPatterns: patterns,
@@ -343,7 +342,6 @@ func loadConfig() config {
 	viper.SetDefault("max_depth", base.MaxDepth)
 	viper.SetDefault("min_text_chars", base.MinTextChars)
 	viper.SetDefault("max_attempts", base.MaxAttempts)
-	viper.SetDefault("m4b", base.BuildM4B)
 	viper.SetDefault("poll_minutes", int(base.PollInterval.Minutes()))
 
 	cfg := config{
@@ -354,7 +352,6 @@ func loadConfig() config {
 		Speed:        viper.GetFloat64("speed"),
 		Bitrate:      viper.GetString("bitrate"),
 		MinTextChars: viper.GetInt("min_text_chars"),
-		BuildM4B:     viper.GetBool("m4b"),
 		MaxAttempts:  viper.GetInt("max_attempts"),
 		PollInterval: time.Duration(viper.GetInt("poll_minutes")) * time.Minute,
 	}
@@ -387,8 +384,8 @@ func loadConfig() config {
 	log.Printf("%s_OUT: %s", ENV_PREFIX, cfg.FolderOut)
 	log.Printf("%s_MAX_DEPTH: %d, %s_VOICE: %s, %s_SPEED: %v, %s_BITRATE: %s",
 		ENV_PREFIX, cfg.MaxDepth, ENV_PREFIX, cfg.Voice, ENV_PREFIX, cfg.Speed, ENV_PREFIX, cfg.Bitrate)
-	log.Printf("%s_MIN_TEXT_CHARS: %d, %s_M4B: %v, %s_POLL_MINUTES: %v, %s_MAX_ATTEMPTS: %d",
-		ENV_PREFIX, cfg.MinTextChars, ENV_PREFIX, cfg.BuildM4B, ENV_PREFIX, cfg.PollInterval, ENV_PREFIX, cfg.MaxAttempts)
+	log.Printf("%s_MIN_TEXT_CHARS: %d, %s_POLL_MINUTES: %v, %s_MAX_ATTEMPTS: %d",
+		ENV_PREFIX, cfg.MinTextChars, ENV_PREFIX, cfg.PollInterval, ENV_PREFIX, cfg.MaxAttempts)
 
 	if cfg.FolderIn == "" || cfg.FolderOut == "" {
 		log.Fatalf("Error: %s_IN and %s_OUT must both be set", ENV_PREFIX, ENV_PREFIX)

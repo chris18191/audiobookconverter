@@ -117,7 +117,6 @@ func TestBooksAreRetriedOnlyUpToMaxAttempts(t *testing.T) {
 	cfg.FolderIn = src
 	cfg.FolderOut = out
 	cfg.MaxAttempts = 2
-	cfg.BuildM4B = false
 
 	books := map[string]*Book{}
 	for round := 1; round <= 3; round++ {

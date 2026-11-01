@@ -143,7 +143,7 @@ func TestConvertBookEndToEnd(t *testing.T) {
 	for _, e := range entries {
 		names = append(names, e.Name())
 	}
-	want := []string{"1 - Chapter One.mp3", "2 - Chapter Two.mp3", "Fixture Book.epub", "Fixture Book.m4b"}
+	want := []string{"Fixture Book.epub", "Fixture Book.m4b"}
 	if len(names) != len(want) {
 		t.Fatalf("output = %v, want %v", names, want)
 	}
@@ -276,7 +276,6 @@ func endToEndFixture(t *testing.T) (cfg config, src, out, fixture string) {
 	cfg.FolderOut = out
 	cfg.Voice = "test_voice"
 	cfg.Bitrate = "64k"
-	cfg.BuildM4B = true
 	return
 }
 
@@ -297,9 +296,9 @@ func TestIncompleteBookIsNotMarkedConverted(t *testing.T) {
 		{
 			name: "the audio cannot be written to the output folder",
 			spoiler: func(bookDir string) {
-				// The copy of the first chapter cannot succeed (a directory of
-				// that name is in the way) while the epub marker could be written.
-				if err := os.MkdirAll(filepath.Join(bookDir, "1 - Chapter One.mp3"), 0o755); err != nil {
+				// The copy of the audiobook cannot succeed (a directory of that
+				// name is in the way) while the epub marker could be written.
+				if err := os.MkdirAll(filepath.Join(bookDir, "Fixture Book.m4b"), 0o755); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -322,5 +321,47 @@ func TestIncompleteBookIsNotMarkedConverted(t *testing.T) {
 				t.Error("the converted marker was written although the book is incomplete")
 			}
 		})
+	}
+}
+
+// A retried book must not keep the audio of an earlier attempt - including the
+// per-chapter mp3 files an older converter wrote - but it keeps the epub.
+func TestMoveFilesReplacesStaleAudio(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	work := func(name string) {
+		if err := os.WriteFile(filepath.Join(src, name), []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"Book.m4b", "chapters.wav", "chapters.txt", "chapters.epub", "cover"} {
+		work(n)
+	}
+	stale := filepath.Join(dst, "1 - Chapter One.mp3")
+	if err := os.WriteFile(stale, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The cover of an earlier attempt is not audio and is excluded anyway.
+	if err := os.WriteFile(filepath.Join(dst, "cover"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveFiles(src, dst, map[string]bool{
+		"chapters.epub": true, "cover": true, "chapters.txt": true,
+	}, []string{".wav", ".txt"}); err != nil {
+		t.Fatalf("moveFiles: %v", err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("the mp3 of an earlier attempt survived")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "Book.m4b")); err != nil {
+		t.Errorf("the new audiobook was not copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "cover")); err != nil {
+		t.Errorf("an excluded file was touched: %v", err)
+	}
+	for _, e := range []string{"chapters.wav", "chapters.txt", "chapters.epub"} {
+		if _, err := os.Stat(filepath.Join(dst, e)); err == nil {
+			t.Errorf("%s was copied to the output folder", e)
+		}
 	}
 }

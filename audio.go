@@ -128,9 +128,10 @@ var derivedWavRE = regexp.MustCompile(`^chapters_chapter_(\d+)_(.+)_chapter_(\d+
 // counts its own chapters, so the pairing of file and title is a guess.
 var wavFallbackRE = regexp.MustCompile(`^chapters_chapter_(\d+)_.*\.wav$`)
 
-// collectChapterAudio maps the wav files audiblez wrote onto our chapters and
-// converts them to mp3, named "<number> - <chapter title>.mp3".
-func collectChapterAudio(workDir string, chapters []epubChapter, bitrate string) ([]chapterAudio, error) {
+// collectChapters maps the wav files audiblez wrote onto our chapters. The wavs
+// are the input of buildM4B; they are never written to the output folder, so no
+// intermediate mp3 exists (and the audio is encoded once instead of twice).
+func collectChapters(workDir string, chapters []epubChapter) ([]chapterAudio, error) {
 	entries, err := os.ReadDir(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("could not read work directory: %w", err)
@@ -162,7 +163,7 @@ func collectChapterAudio(workDir string, chapters []epubChapter, bitrate string)
 		name, ok := byNumber[i+1]
 		if !ok {
 			// Fall back to audiblez's own counter. It skips empty chapters, so
-			// the mapping degrades gracefully instead of mislabelling files.
+			// the mapping degrades instead of mislabelling the audio.
 			name, ok = byIndex[i+1]
 			if ok {
 				log.Printf("chapter %d (%s) matched by the audiblez counter, not by name: %s",
@@ -174,15 +175,10 @@ func collectChapterAudio(workDir string, chapters []epubChapter, bitrate string)
 			continue
 		}
 		seen[name] = true
-		mp3Name := fmt.Sprintf("%0*d - %s.mp3", numberWidth(len(chapters)), i+1, sanitizeFileName(ch.Title))
-		mp3Path := filepath.Join(workDir, mp3Name)
-		if err := convertToMP3(filepath.Join(workDir, name), mp3Path, bitrate); err != nil {
-			return nil, err
-		}
 		out = append(out, chapterAudio{
 			Title:    ch.Title,
-			MP3File:  mp3Name,
-			Duration: probeDuration(mp3Path),
+			File:     name,
+			Duration: probeDuration(filepath.Join(workDir, name)),
 		})
 	}
 	if len(out) == 0 {
@@ -191,20 +187,11 @@ func collectChapterAudio(workDir string, chapters []epubChapter, bitrate string)
 	return out, nil
 }
 
+// chapterAudio is one chapter of the book, in reading order, as audiblez wrote it.
 type chapterAudio struct {
 	Title    string
-	MP3File  string
+	File     string // the wav file, relative to the work directory
 	Duration float64
-}
-
-func convertToMP3(wavPath, mp3Path, bitrate string) error {
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-		"-i", filepath.Base(wavPath), "-ac", "2", "-b:a", bitrate, filepath.Base(mp3Path))
-	cmd.Dir = filepath.Dir(wavPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("could not convert %s to mp3: %w: %s", filepath.Base(wavPath), err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 func probeDuration(file string) float64 {
@@ -221,7 +208,7 @@ func probeDuration(file string) float64 {
 	return d
 }
 
-// buildM4B concatenates the chapter mp3s into a single chaptered .m4b. audiblez
+// buildM4B concatenates the chapter wavs into a single chaptered .m4b. audiblez
 // builds its own m4b with the libfdk_aac encoder, which the ffmpeg build of the
 // Debian slim images does not provide, so relying on it would silently leave us
 // without an audiobook file - and with "Chapter 0/1/2" as chapter titles.
@@ -241,10 +228,10 @@ func buildM4B(workDir string, chapters []chapterAudio, meta bookMetadata, destNa
 	md.WriteString("\n")
 	start := int64(0)
 	for _, c := range chapters {
-		fmt.Fprintf(&list, "file '%s'\n", strings.ReplaceAll(c.MP3File, "'", `'\''`))
+		fmt.Fprintf(&list, "file '%s'\n", strings.ReplaceAll(c.File, "'", `'\''`))
 		dur := int64(c.Duration * 1000)
 		if dur <= 0 {
-			return fmt.Errorf("could not determine the duration of %s", c.MP3File)
+			return fmt.Errorf("could not determine the duration of %s", c.File)
 		}
 		// The title only: epub chapter titles carry their own numbering
 		// ("1. Origins"), a second prefix would read "1. 1. Origins".
@@ -317,17 +304,10 @@ func sanitizeFileName(title string) string {
 
 func utf8Len(s string) int { return len([]rune(s)) }
 
-// numberWidth is the zero padding needed to sort chapter numbers by name.
-func numberWidth(total int) int {
-	if total < 10 {
-		return 1
-	}
-	return len(strconv.Itoa(total))
-}
-
-// moveFiles copies the finished files into the destination directory. The mp3
-// files of an earlier attempt that this run did not produce again are removed:
-// a retried book must not keep the audio of a previous attempt beside its own.
+// moveFiles copies the finished files into the destination directory. Audio of an
+// earlier attempt that this run did not produce again is removed: a retried book
+// must not keep the audio of a previous attempt beside its own - which includes
+// the chapter mp3 files an older version of the converter wrote there.
 func moveFiles(srcDir string, destDir string, excludeNames map[string]bool, excludeExtensions []string) error {
 	files, err := os.ReadDir(srcDir)
 	if err != nil {
@@ -361,7 +341,8 @@ func moveFiles(srcDir string, destDir string, excludeNames map[string]bool, excl
 	}
 	for _, file := range leftovers {
 		name := file.Name()
-		if file.IsDir() || copied[name] || !strings.EqualFold(filepath.Ext(name), ".mp3") {
+		ext := strings.ToLower(filepath.Ext(name))
+		if file.IsDir() || copied[name] || (ext != ".mp3" && ext != ".m4b") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(destDir, name)); err != nil {

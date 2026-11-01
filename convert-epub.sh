@@ -16,7 +16,6 @@ cache_volume="${ABC_CACHE_VOLUME:-audiobookconverter-models}"
 voice=""
 bitrate=""
 speed=""
-no_m4b=false
 keep_patterns=""
 extra_skip_patterns=""
 attempts=1
@@ -41,10 +40,8 @@ Options:
                          runs (default: $cache_volume; without it every
                          run downloads the model again)
   -v, --voice VOICE      piper voice, e.g. bm_lewis (default: the image's)
-  -b, --bitrate BITRATE  mp3 bitrate, e.g. 128k (default: the image's)
+  -b, --bitrate BITRATE  AAC bitrate of the .m4b, e.g. 128k (default: the image's)
   -s, --speed FACT       speech rate between 0.5 and 2.0
-      --no-m4b           keep the chapter mp3 files only, do not build the
-                         single .m4b file
       --keep-regex RE    rescue chapters whose title matches a skip pattern
       --skip-regex RE    drop more chapters, in addition to the defaults
   -a, --attempts N       conversion attempts per book (default: 1)
@@ -71,7 +68,6 @@ while [[ $# -gt 0 ]]; do
 	-v | --voice) [[ $# -ge 2 ]] || die "$1 needs an argument"; voice="$2"; shift 2 ;;
 	-b | --bitrate) [[ $# -ge 2 ]] || die "$1 needs an argument"; bitrate="$2"; shift 2 ;;
 	-s | --speed) [[ $# -ge 2 ]] || die "$1 needs an argument"; speed="$2"; shift 2 ;;
-	--no-m4b) no_m4b=true; shift ;;
 	--keep-regex) [[ $# -ge 2 ]] || die "$1 needs an argument"; keep_patterns="$2"; shift 2 ;;
 	--skip-regex) [[ $# -ge 2 ]] || die "$1 needs an argument"; extra_skip_patterns="$2"; shift 2 ;;
 	-a | --attempts) [[ $# -ge 2 ]] || die "$1 needs an argument"; attempts="$2"; shift 2 ;;
@@ -142,7 +138,6 @@ if [[ -n "$bitrate" ]]; then run+=(-e CONVERTER_BITRATE="$bitrate"); fi
 if [[ -n "$speed" ]]; then run+=(-e CONVERTER_SPEED="$speed"); fi
 if [[ -n "$keep_patterns" ]]; then run+=(-e CONVERTER_KEEP_PATTERNS="$keep_patterns"); fi
 if [[ -n "$extra_skip_patterns" ]]; then run+=(-e CONVERTER_EXTRA_SKIP_PATTERNS="$extra_skip_patterns"); fi
-if $no_m4b; then run+=(-e CONVERTER_M4B=false); fi
 run+=("$image" /opt/audiobookconverter)
 
 if $dry_run; then
@@ -216,7 +211,7 @@ for f in "${pending[@]}"; do
 	ok)
 		printf '%s:\n' "$book"
 		find "$output/${book%.epub}" -maxdepth 1 -type f \
-			\( -name '*.mp3' -o -name '*.m4b' \) -printf '  %f\n' | sort || true
+			-name '*.m4b' -printf '  %f\n' | sort || true
 		;;
 	failed)
 		printf '%s: failed\n' "$book"
