@@ -1,4 +1,8 @@
 # Books are mounted at runtime; they must not enter the build context.
 *.epub
+# Neither are the converted audiobooks of a local run ('-o out').
+out/
+*.m4b
+*.mp3
 audiobookconverter
 *_test.go
