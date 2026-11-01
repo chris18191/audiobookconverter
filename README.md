@@ -20,9 +20,13 @@ For each `<Book>.epub` in the input folder:
    generated `Contents` pages calibre emits), documents labelled with a
    non-content `epub:type` (`page-list`, `bibliography`, `index`, `colophon`,
    `cover`, ...), documents whose title matches a back matter pattern
-   (bibliography, glossary, acknowledgments, about the author, ...), and front or
-   back matter too short to be a chapter. Everything audiblez needs to keep -
-   the reading order and the text - is untouched.
+   (bibliography, glossary, acknowledgments, about the author, ...), fragments
+   the table of contents does not mention (the second half of a document calibre
+   split in pieces), and documents too short to hold a chapter. For a book
+   without any table of contents, length is the only clue, and a document with a
+   chapter's worth of text is kept. The log lists every dropped document with
+   the reason. Everything audiblez needs to keep - the reading order and the
+   text - is untouched.
 3. **Build a chapters-only epub** (`chapter_01.xhtml`, `chapter_02.xhtml`, ...
    in spine order, with the original metadata and cover, and without the images,
    which are irrelevant for speech synthesis).

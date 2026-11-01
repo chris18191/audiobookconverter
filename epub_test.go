@@ -65,10 +65,8 @@ func TestSelectionOnShippedBook(t *testing.T) {
 	// acknowledgments, about the author, the series page, glossary, and both
 	// bibliography files (one of which calibre split in two).
 	f := defaultFilter(t)
-	prev := false
 	for _, c := range b.spine {
-		keep, reason := b.keepChapter(c, f, prev)
-		prev = keep
+		keep, reason := b.keepChapter(c, f)
 		t.Logf("%-28s keep=%-5v %-32s %q", c.ZipPath, keep, reason, c.Title)
 	}
 }
@@ -178,6 +176,47 @@ func TestDerivedEpubKeepsRelativeHrefs(t *testing.T) {
 	}
 }
 
+func TestHrefHelpers(t *testing.T) {
+	relCases := []struct{ dir, zip, want string }{
+		{"", "chapter_01.xhtml", "chapter_01.xhtml"},
+		{".", "OEBPS/chapter_01.xhtml", "OEBPS/chapter_01.xhtml"},
+		{"OEBPS", "OEBPS/chapter_01.xhtml", "chapter_01.xhtml"},
+		{"OEBPS", "Text/chapter_01.xhtml", "../Text/chapter_01.xhtml"},
+		{"A/B", "A/C/chapter_01.xhtml", "../C/chapter_01.xhtml"},
+		{"A/B/C", "A/B/C/D/chapter_01.xhtml", "D/chapter_01.xhtml"},
+	}
+	for _, c := range relCases {
+		if got := relHref(c.dir, c.zip); got != c.want {
+			t.Errorf("relHref(%q, %q) = %q, want %q", c.dir, c.zip, got, c.want)
+		}
+	}
+
+	joinCases := []struct{ base, href, want string }{
+		{"OEBPS", "c1.xhtml", "OEBPS/c1.xhtml"},
+		{"OEBPS", "../Text/c1.xhtml", "Text/c1.xhtml"},
+		{"OEBPS", "./c1.xhtml", "OEBPS/c1.xhtml"},
+		{"OEBPS", "c1.xhtml#part", "OEBPS/c1.xhtml"},
+		{"", "OEBPS/c1.xhtml", "OEBPS/c1.xhtml"},
+		// An href starting at the root of the container (legal in EPUB 2).
+		{"OEBPS", "/OEBPS/text/c1.xhtml", "OEBPS/text/c1.xhtml"},
+		{"OEBPS", "/c1.xhtml", "c1.xhtml"},
+		// Percent encoded file names, including non ascii ones.
+		{"OEBPS", "the%20chapter.xhtml", "OEBPS/the chapter.xhtml"},
+		{"OEBPS", "%D8%B1.xhtml", "OEBPS/ر.xhtml"},
+	}
+	for _, c := range joinCases {
+		if got := joinHref(c.base, c.href); got != c.want {
+			t.Errorf("joinHref(%q, %q) = %q, want %q", c.base, c.href, got, c.want)
+		}
+	}
+	// A manifest href and the toc href for the same document have to produce the
+	// same zip path, or the chapter loses its title: the two documents live in
+	// different directories.
+	if joinHref("OEBPS", "c1.xhtml") != joinHref("OEBPS/Text", "../c1.xhtml") {
+		t.Error("the same document resolved to two different zip paths")
+	}
+}
+
 func TestKeepChapterRules(t *testing.T) {
 	skip, err := compilePatterns(defaultSkipPatterns)
 	if err != nil {
@@ -192,12 +231,12 @@ func TestKeepChapterRules(t *testing.T) {
 	text := func(n int) string { return strings.Repeat("x", n) }
 
 	cases := []struct {
-		name     string
-		ch       epubChapter
-		prevKept bool
-		filter   chapterFilter
-		keep     bool
-		reason   string
+		name   string
+		book   *epubBook
+		ch     epubChapter
+		filter chapterFilter
+		keep   bool
+		reason string
 	}{
 		{
 			name:   "title page",
@@ -205,19 +244,20 @@ func TestKeepChapterRules(t *testing.T) {
 			filter: f, reason: "too little text",
 		},
 		{
-			name:     "split back matter tail is a continuation",
-			ch:       epubChapter{Title: "c2WT", Text: text(30000)},
-			prevKept: true, filter: f, keep: true, reason: "continuation of previous chapter",
+			name:   "unnamed document in a book without a toc",
+			ch:     epubChapter{Title: "c2WT", Text: text(30000)},
+			filter: f, keep: true, reason: "untitled but substantial",
 		},
 		{
-			name:   "unnamed document at the start",
-			ch:     epubChapter{Title: "c9", Text: text(30000)},
+			name:   "unnamed document a toc does not mention",
+			book:   &epubBook{hasTOC: true},
+			ch:     epubChapter{Title: "c2WT", Text: text(30000)},
+			filter: f, reason: "not in the table of contents",
+		},
+		{
+			name:   "unnamed document without enough text",
+			ch:     epubChapter{Title: "c9", Text: text(300)},
 			filter: f, reason: "untitled",
-		},
-		{
-			name:     "unnamed document without enough text",
-			ch:       epubChapter{Title: "c9", Text: text(300)},
-			prevKept: true, filter: f, reason: "untitled",
 		},
 		{
 			name:   "short named document",
@@ -262,7 +302,11 @@ func TestKeepChapterRules(t *testing.T) {
 	}
 	for _, c := range cases {
 		ch := c.ch
-		keep, reason := (&epubBook{}).keepChapter(&ch, c.filter, c.prevKept)
+		book := c.book
+		if book == nil {
+			book = &epubBook{}
+		}
+		keep, reason := book.keepChapter(&ch, c.filter)
 		if keep != c.keep || reason != c.reason {
 			t.Errorf("%s: got (%v, %q), want (%v, %q)", c.name, keep, reason, c.keep, c.reason)
 		}

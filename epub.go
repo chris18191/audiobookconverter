@@ -6,11 +6,14 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	nethtml "golang.org/x/net/html"
 )
@@ -86,7 +89,9 @@ type epubChapter struct {
 	LinkChars  int
 }
 
-func (c *epubChapter) charCount() int { return len(c.Text) }
+// charCount counts characters, the way audiblez measures the text it has to
+// speak (Python len()), not bytes.
+func (c *epubChapter) charCount() int { return utf8.RuneCountInString(c.Text) }
 
 // named reports whether the chapter has a human readable title to name the
 // audio file after.
@@ -114,6 +119,7 @@ type epubBook struct {
 	spineIDs  []string
 	spine     []*epubChapter // documents in reading order
 	ncxPath   string         // path of the book's NCX inside the zip, if any
+	hasTOC    bool           // the book has a table of contents with entries
 	coverID   string
 }
 
@@ -148,12 +154,14 @@ func openEpub(p string) (*epubBook, error) {
 	if err != nil {
 		return nil, err
 	}
+	b.hasTOC = len(labels) > 0
 
 	byID := make(map[string]manifestItem, len(b.items))
 	for _, it := range b.items {
 		byID[it.ID] = it
 	}
 	navDoc := b.navPath()
+	seen := map[string]bool{}
 	for _, idref := range b.spineIDs {
 		it, ok := byID[idref]
 		if !ok || !isDocument(it) {
@@ -163,6 +171,13 @@ func openEpub(p string) (*epubBook, error) {
 		if zipPath == navDoc {
 			continue // the EPUB3 nav document is a table of contents
 		}
+		if seen[zipPath] {
+			// A spine that lists the same document twice would have audiblez
+			// speak the section twice.
+			log.Printf("'%s' is referenced by the spine more than once: narrating it once", zipPath)
+			continue
+		}
+		seen[zipPath] = true
 		ch := &epubChapter{ZipPath: zipPath, ManifestID: it.ID, Roles: map[string]bool{}}
 		if raw, err := readZipEntry(&zr.Reader, zipPath); err == nil {
 			a := analyseHTML(raw)
@@ -179,6 +194,10 @@ func openEpub(p string) (*epubBook, error) {
 				ch.Title = a.DocTitle
 				ch.FromHead = true
 			}
+		} else {
+			// Without the text there is nothing to select on, so this document
+			// will most likely be dropped: say so instead of hiding it.
+			log.Printf("the document %s cannot be read from the epub: %v", zipPath, err)
 		}
 		if entry, ok := labels[zipPath]; ok && entry.Title != "" {
 			ch.Title = entry.Title
@@ -332,9 +351,11 @@ type tocEntry struct {
 // document with a fragment).
 func (b *epubBook) tocLabels(zr *zip.Reader) (map[string]tocEntry, error) {
 	labels := map[string]tocEntry{}
-	add := func(entries []tocEntry) {
+	// A toc href is relative to the toc document, which need not live next to
+	// the package.
+	add := func(entries []tocEntry, baseDir string) {
 		for _, e := range entries {
-			key := joinHref(b.opfDir, e.Href)
+			key := joinHref(baseDir, e.Href)
 			if cur, dup := labels[key]; !dup || e.Depth < cur.Depth {
 				labels[key] = e
 			}
@@ -344,12 +365,13 @@ func (b *epubBook) tocLabels(zr *zip.Reader) (map[string]tocEntry, error) {
 	if nav := b.navPath(); nav != "" {
 		if raw, err := readZipEntry(zr, nav); err == nil {
 			if entries, ok := parseNavTOC(raw); ok {
-				add(entries)
+				add(entries, path.Dir(nav))
 				return labels, nil
 			}
 		}
 	}
-	// EPUB2 NCX.
+	// EPUB2 NCX. A broken or missing toc costs the book its chapter titles, not
+	// the audiobook: the headings inside the documents are the fallback.
 	for _, it := range b.items {
 		if it.MediaType != "application/x-dtbncx+xml" {
 			continue
@@ -357,13 +379,15 @@ func (b *epubBook) tocLabels(zr *zip.Reader) (map[string]tocEntry, error) {
 		b.ncxPath = joinHref(b.opfDir, it.Href)
 		raw, err := readZipEntry(zr, b.ncxPath)
 		if err != nil {
-			return nil, err
+			log.Printf("the table of contents of the epub (%s) cannot be read: %v", b.ncxPath, err)
+			return labels, nil
 		}
 		entries, err := parseNCX(raw)
 		if err != nil {
-			return nil, err
+			log.Printf("the table of contents of the epub (%s) cannot be parsed: %v", b.ncxPath, err)
+			return labels, nil
 		}
-		add(entries)
+		add(entries, path.Dir(b.ncxPath))
 		break
 	}
 	return labels, nil
@@ -555,22 +579,27 @@ type chapterFilter struct {
 // selectedChapters returns the readable chapters in reading order.
 func (b *epubBook) selectedChapters(f chapterFilter) []epubChapter {
 	var out []epubChapter
-	prevKept := false
 	for _, ch := range b.spine {
-		keep, reason := b.keepChapter(ch, f, prevKept)
-		_ = reason
+		keep, reason := b.keepChapter(ch, f)
 		if keep {
 			out = append(out, *ch)
-			prevKept = true
 			continue
 		}
-		prevKept = false
+		// The reason belongs in the log: "why is chapter X missing" is the
+		// question this answers.
+		log.Printf("  skipping '%s' (%d characters): %s", ch.Title, ch.charCount(), reason)
 	}
 	return out
 }
 
-// keepChapter applies the structural rules, then the title rules.
-func (b *epubBook) keepChapter(ch *epubChapter, f chapterFilter, prevKept bool) (bool, string) {
+// keepChapter applies the keep patterns, then the structural rules, then the
+// title rules.
+func (b *epubBook) keepChapter(ch *epubChapter, f chapterFilter) (bool, string) {
+	// An explicit keep pattern wins over everything below: it is how a real
+	// chapter called "Index of Translated Works" survives the built-in list.
+	if matchAny(f.KeepPatterns, ch.Title) {
+		return true, "keep pattern"
+	}
 	if ch.looksLikeTOC() {
 		return false, "table of contents"
 	}
@@ -578,9 +607,6 @@ func (b *epubBook) keepChapter(ch *epubChapter, f chapterFilter, prevKept bool) 
 		if nonContentRoles[role] {
 			return false, "epub:type=" + role
 		}
-	}
-	if matchAny(f.KeepPatterns, ch.Title) {
-		return true, "keep pattern"
 	}
 	if ch.charCount() < audiblezMinChapterChars {
 		return false, "too little text"
@@ -594,10 +620,16 @@ func (b *epubBook) keepChapter(ch *epubChapter, f chapterFilter, prevKept bool) 
 	if hasAnyRole(ch, contentRoles) {
 		return true, "content role"
 	}
-	// Untitled document: either the continuation of a document calibre split in
-	// pieces (back matter tail) or filler. Only keep substantial continuations.
-	if prevKept && ch.charCount() >= f.MinTextChars {
-		return true, "continuation of previous chapter"
+	// Untitled document: no toc entry, no heading, no content role. If the book
+	// has a table of contents, it did not mention this document, so it is a
+	// fragment (a calibre split of another file) or filler. Without any toc
+	// there is nothing to go by except length, and dropping the first chapter of
+	// a novel would drop every chapter after it too.
+	if b.hasTOC {
+		return false, "not in the table of contents"
+	}
+	if ch.charCount() >= f.MinTextChars {
+		return true, "untitled but substantial"
 	}
 	return false, "untitled"
 }
@@ -702,6 +734,13 @@ func (b *epubBook) writeDerivedEpub(dest string, chapters []epubChapter) ([]stri
 	for _, ch := range chapters {
 		keptPath[ch.ZipPath] = true
 	}
+	// A stray member of the zip that carries one of the canonical names (and is
+	// not referenced by the package) must not be copied over the chapter we
+	// generated under that name: a zip with two entries of one name is broken.
+	generated := make(map[string]bool, len(names))
+	for _, n := range names {
+		generated[n] = true
+	}
 	ncxPath := b.ncxPath
 	if ncxPath == "" {
 		ncxPath = path.Join(b.opfDir, "toc.ncx")
@@ -713,7 +752,7 @@ func (b *epubBook) writeDerivedEpub(dest string, chapters []epubChapter) ([]stri
 		b.navPath(): true,
 	}
 	for _, f := range zr.File {
-		if regenerated[f.Name] || keptPath[f.Name] {
+		if regenerated[f.Name] || keptPath[f.Name] || generated[f.Name] {
 			continue
 		}
 		if item, ok := b.itemByPath(f.Name); ok {
@@ -910,29 +949,43 @@ func isDocument(it manifestItem) bool {
 // relHref expresses a zip path as an href relative to dir. Manifest and navMap
 // hrefs are resolved against the directory of their own document, not against
 // the root of the container, so a book whose package sits in OEBPS must not be
-// told to look for OEBPS/OEBPS/chapter_01.xhtml.
+// told to look for OEBPS/OEBPS/chapter_01.xhtml. Documents outside that
+// directory (a Text/ folder next to OEBPS/) are reached with "..".
 func relHref(dir, zipPath string) string {
 	if dir == "" || dir == "." {
 		return zipPath
 	}
-	prefix := strings.TrimSuffix(dir, "/") + "/"
-	if strings.HasPrefix(zipPath, prefix) {
-		return zipPath[len(prefix):]
+	// Climb out of dir up to the directory the two paths share, then walk down
+	// again: "OEBPS" -> "Text/x.xhtml" is "../Text/x.xhtml", "A/B" ->
+	// "A/C/x.xhtml" is "../C/x.xhtml".
+	dirs := strings.Split(dir, "/")
+	parts := strings.Split(zipPath, "/")
+	shared := 0
+	for shared < len(dirs) && shared < len(parts)-1 && dirs[shared] == parts[shared] {
+		shared++
 	}
-	return zipPath
+	return strings.Repeat("../", len(dirs)-shared) + strings.Join(parts[shared:], "/")
 }
 
-// joinHref resolves a manifest href against the package directory and
-// normalises it into a zip entry name.
-func joinHref(opfDir, href string) string {
+// joinHref resolves an href against the directory of the document it comes from
+// (the package for manifest hrefs, the toc for navMap hrefs) and normalises it
+// into a zip entry name. A leading "/" is the root of the container, and hrefs
+// may be percent encoded.
+func joinHref(baseDir, href string) string {
 	href = strings.SplitN(href, "#", 2)[0]
 	href = strings.SplitN(href, "?", 2)[0]
-	href = strings.ReplaceAll(href, "%20", " ")
+	if dec, err := url.PathUnescape(href); err == nil {
+		href = dec
+	}
+	href = strings.ReplaceAll(href, "\\/", "/")
+	if root := strings.TrimPrefix(href, "/"); root != href {
+		return path.Clean(root)
+	}
 	href = strings.TrimPrefix(href, "./")
-	if opfDir == "" || opfDir == "." {
+	if baseDir == "" || baseDir == "." {
 		return path.Clean(href)
 	}
-	return path.Clean(path.Join(opfDir, href))
+	return path.Clean(path.Join(baseDir, href))
 }
 
 func readZipEntry(zr *zip.Reader, name string) ([]byte, error) {

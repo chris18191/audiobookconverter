@@ -99,6 +99,9 @@ func runAudiblez(workDir string, cfg config, status *conversionStatus) error {
 			}
 			log.Printf("audiblez: %s", line)
 		}
+		if err := sc.Err(); err != nil {
+			log.Printf("audiblez output could not be read: %v", err)
+		}
 	}
 	wg.Add(2)
 	go read(stdout)
@@ -121,7 +124,8 @@ func formatSpeed(speed float64) string {
 var derivedWavRE = regexp.MustCompile(`^chapters_chapter_(\d+)_(.+)_chapter_(\d+)\.[A-Za-z0-9]+\.wav$`)
 
 // wavFallbackRE is used if audiblez ever changes the trailing part of its file
-// names again: the leading counter still orders the chapters.
+// names: the leading counter is then the only hint of the order, and audiblez
+// counts its own chapters, so the pairing of file and title is a guess.
 var wavFallbackRE = regexp.MustCompile(`^chapters_chapter_(\d+)_.*\.wav$`)
 
 // collectChapterAudio maps the wav files audiblez wrote onto our chapters and
@@ -321,8 +325,9 @@ func numberWidth(total int) int {
 	return len(strconv.Itoa(total))
 }
 
-// moveFiles copies the finished files into the destination directory and removes
-// the intermediate audio of the work directory.
+// moveFiles copies the finished files into the destination directory. The mp3
+// files of an earlier attempt that this run did not produce again are removed:
+// a retried book must not keep the audio of a previous attempt beside its own.
 func moveFiles(srcDir string, destDir string, excludeNames map[string]bool, excludeExtensions []string) error {
 	files, err := os.ReadDir(srcDir)
 	if err != nil {
@@ -331,6 +336,7 @@ func moveFiles(srcDir string, destDir string, excludeNames map[string]bool, excl
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("could not create destination directory %s: %w", destDir, err)
 	}
+	copied := map[string]bool{}
 	for _, file := range files {
 		if file.IsDir() {
 			continue
@@ -347,6 +353,21 @@ func moveFiles(srcDir string, destDir string, excludeNames map[string]bool, excl
 		if err := copyFile(src, dest); err != nil {
 			return err
 		}
+		copied[name] = true
+	}
+	leftovers, err := os.ReadDir(destDir)
+	if err != nil {
+		return fmt.Errorf("could not read destination directory %s: %w", destDir, err)
+	}
+	for _, file := range leftovers {
+		name := file.Name()
+		if file.IsDir() || copied[name] || !strings.EqualFold(filepath.Ext(name), ".mp3") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(destDir, name)); err != nil {
+			return fmt.Errorf("could not remove the audio of an earlier attempt %s: %w", name, err)
+		}
+		log.Printf("Removed '%s': this attempt did not produce it", name)
 	}
 	return nil
 }

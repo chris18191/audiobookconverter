@@ -212,6 +212,16 @@ func convertBook(book *Book, cfg config) error {
 		return err
 	}
 	if len(audio) < len(chapters) {
+		if audiblezErr != nil {
+			// audiblez died in the middle of the synthesis. Shipping the first
+			// third of the book as if it were the whole book is worse than
+			// retrying it on the next scan, and the converted marker is only
+			// written when this returns without error.
+			return fmt.Errorf("audiblez stopped after %d of %d chapters: %w",
+				len(audio), len(chapters), audiblezErr)
+		}
+		// audiblez itself skipped the rest (no speech could be generated for
+		// them); keep what exists and say which chapters are missing.
 		log.Printf("Only %d of %d chapters have audio", len(audio), len(chapters))
 	}
 	book.Chapters = len(audio)
@@ -223,13 +233,8 @@ func convertBook(book *Book, cfg config) error {
 		}
 	}
 
-	// The epub itself is copied into the output folder: it marks the book as
-	// converted on the next scan.
 	if err := os.MkdirAll(bookFolder, 0o755); err != nil {
 		return fmt.Errorf("could not create destination directory %s: %w", bookFolder, err)
-	}
-	if err := copyFile(book.EpubPath, filepath.Join(bookFolder, book.BookName)); err != nil {
-		return err
 	}
 	exclude := map[string]bool{
 		derivedEpubName:       true, // our intermediate epub
@@ -240,6 +245,12 @@ func convertBook(book *Book, cfg config) error {
 		"chapters.tmp.mp4":    true,
 	}
 	if err := moveFiles(workDir, bookFolder, exclude, []string{".wav", ".txt"}); err != nil {
+		return err
+	}
+	// The source epub is copied last: its presence in the output folder is what
+	// marks the book as converted, and a failed copy of the audio must leave the
+	// book retryable instead of finished without audio.
+	if err := copyFile(book.EpubPath, filepath.Join(bookFolder, book.BookName)); err != nil {
 		return err
 	}
 	log.Printf("Audio written to %s", bookFolder)
@@ -266,6 +277,12 @@ func scanFolder(books map[string]*Book, cfg config, folder string, isSource bool
 			books[basename] = book
 		}
 		if isSource {
+			if other := book.EpubPath; other != "" && other != epub {
+				// Two different epubs cannot share one output folder, so the
+				// second one is reported instead of silently replacing the first.
+				log.Printf("'%s' was already found at '%s': ignoring '%s'", basename, other, epub)
+				continue
+			}
 			book.SourceFolder = filepath.Dir(epub)
 			book.EpubPath = epub
 			book.Status = New

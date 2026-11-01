@@ -108,6 +108,10 @@ with zipfile.ZipFile(epub) as z:
                         "-i", "sine=frequency=200:duration=%.1f" % (0.5 + index * 0.5),
                         "-ar", "24000", "-ac", "1", out], check=True)
         print("Progress: %d%%" % (index * 100 // max(index, len(idrefs))))
+        stop = os.environ.get("FAKE_STOP_AFTER")
+        if stop and index >= int(stop):
+            print("simulated death in the middle of the synthesis", file=sys.stderr)
+            sys.exit(1)
 print("Estimated time remaining: 00d 00h 00m 01s")
 `
 	path := filepath.Join(dir, "audiblez")
@@ -119,23 +123,8 @@ print("Estimated time remaining: 00d 00h 00m 01s")
 }
 
 func TestConvertBookEndToEnd(t *testing.T) {
-	requireFFMpeg(t)
-	dir := t.TempDir()
-	src := filepath.Join(dir, "in")
-	out := filepath.Join(dir, "out")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	fixture := writeFixtureEpub(t, filepath.Join(src, "Fixture Book.epub"), true)
-	argsFile := filepath.Join(dir, "args")
-	fakeAudiblez(t, argsFile)
-
-	cfg := defaultConfig()
-	cfg.FolderIn = src
-	cfg.FolderOut = out
-	cfg.Voice = "test_voice"
-	cfg.Bitrate = "64k"
-	cfg.BuildM4B = true
+	cfg, src, out, fixture := endToEndFixture(t)
+	argsFile := os.Getenv("FAKE_ARGS_FILE")
 
 	b := &Book{EpubPath: fixture, BookName: "Fixture Book.epub", SourceFolder: src}
 	if err := convertBook(b, cfg); err != nil {
@@ -263,5 +252,75 @@ func requireFFMpeg(t *testing.T) {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Skipf("%s not available", bin)
 		}
+	}
+}
+
+// endToEndFixture sets up an input folder with the fixture book, a stub audiblez
+// and the matching config.
+func endToEndFixture(t *testing.T) (cfg config, src, out, fixture string) {
+	t.Helper()
+	requireFFMpeg(t)
+	dir := t.TempDir()
+	src = filepath.Join(dir, "in")
+	out = filepath.Join(dir, "out")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture = writeFixtureEpub(t, filepath.Join(src, "Fixture Book.epub"), true)
+	fakeAudiblez(t, filepath.Join(dir, "args"))
+	cfg = defaultConfig()
+	cfg.FolderIn = src
+	cfg.FolderOut = out
+	cfg.Voice = "test_voice"
+	cfg.Bitrate = "64k"
+	cfg.BuildM4B = true
+	return
+}
+
+// The copy of the epub in the output folder is the marker of a finished book:
+// nothing may be written there before the audio arrived.
+func TestIncompleteBookIsNotMarkedConverted(t *testing.T) {
+	cfg, src, out, fixture := endToEndFixture(t)
+
+	tests := []struct {
+		name    string
+		spoiler func(bookDir string)
+		env     string
+	}{
+		{
+			name: "audiblez dies after the first chapter",
+			env:  "1",
+		},
+		{
+			name: "the audio cannot be written to the output folder",
+			spoiler: func(bookDir string) {
+				// The copy of the first chapter cannot succeed (a directory of
+				// that name is in the way) while the epub marker could be written.
+				if err := os.MkdirAll(filepath.Join(bookDir, "1 - Chapter One.mp3"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bookDir := filepath.Join(out, "Fixture Book")
+			if tc.spoiler != nil {
+				tc.spoiler(bookDir)
+			}
+			if tc.env != "" {
+				t.Setenv("FAKE_STOP_AFTER", tc.env)
+			}
+			b := &Book{EpubPath: fixture, BookName: "Fixture Book.epub", SourceFolder: src}
+			if err := convertBook(b, cfg); err == nil {
+				t.Fatal("convertBook reported success")
+			}
+			if _, err := os.Stat(filepath.Join(bookDir, "Fixture Book.epub")); err == nil {
+				t.Error("the converted marker was written although the book is incomplete")
+			}
+		})
 	}
 }
