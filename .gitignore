@@ -1,0 +1,5 @@
+# Build output
+/audiobookconverter
+
+# Books are input, not source
+*.epub

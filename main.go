@@ -2,12 +2,12 @@ package main
 
 import (
 	"fmt"
-	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,7 +25,7 @@ const (
 
 func (ps ProcessingState) String() string {
 	return map[ProcessingState]string{
-		Error:     "Unknown",
+		Error:     "Failed",
 		New:       "Not yet processed",
 		InProcess: "Currently processing",
 		Done:      "Finished",
@@ -38,353 +38,438 @@ type Book struct {
 	SourceFolder  string
 	TargetFolder  string
 	Status        ProcessingState
-	TimeRemaining time.Duration
 	Progress      int
+	TimeRemaining string
+	Chapters      int
+	Attempts      int
+	LastError     string
 }
 
 const (
 	ENV_PREFIX = "CONVERTER"
+
+	defaultVoice    = "bm_lewis"
+	defaultBitrate  = "192k"
+	defaultMinText  = 1000
+	defaultMaxDepth = 3
+	defaultMaxTry   = 3
+	defaultPollMins = 60
 )
 
-var (
-	VOICE      = "bm_lewis"
-	FOLDER_IN  = ""
-	FOLDER_OUT = ""
+// defaultSkipPatterns are matched case insensitively against a chapter's title.
+// They cover the structural and back matter that must not be narrated; a book
+// that names a real chapter after one of these words can be rescued with
+// CONVERTER_KEEP_PATTERNS.
+var defaultSkipPatterns = []string{
+	`^(table of )?contents$`,
+	`^toc$`,
+	`^(references?|bibliography|works cited|end ?notes|source notes)\b`,
+	`^glossary\b`,
+	`^index$`,
+	`^(copyright|©)\b`,
+	`^(colophon|imprimatur)\b`,
+	`^(title ?page|half ?title|series page)\b`,
+	`^(also by|more by|by the same author)\b`,
+	`^acknowledg`,
+	`^about the (author|editor|translator|illustrator|photographer)\b`,
+	`^(a )?note on\b`,
+	`^(praise for|advance praise)\b`,
+	`^(advertisement|advertisements|also available|promotion)\b`,
+	`^(dedication|epigraph)\b`,
+	`^publisher'?s? (note|information)\b`,
+	`\bbook series$`,
+	`^(errata|corrections)$`,
+}
 
-	TRAVERSAL_MAX_DEPTH = 3
-	FFMPEG_AVAILABLE    = false
-
-	books = make(map[string]Book)
-)
+type config struct {
+	FolderIn     string
+	FolderOut    string
+	MaxDepth     int
+	Voice        string
+	Speed        float64
+	Bitrate      string
+	MinTextChars int
+	SkipPatterns []*regexp.Regexp
+	KeepPatterns []*regexp.Regexp
+	BuildM4B     bool
+	MaxAttempts  int
+	PollInterval time.Duration
+}
 
 func main() {
-
-	// CHECKS
-	performChecks()
-	// CHECKS OK!
+	cfg := loadConfig()
+	books := make(map[string]*Book)
 
 	for {
-		// Read input folder
-		files, err := traverseAndFindEpub(FOLDER_IN)
-		if err != nil {
-			fmt.Printf("Failed to traverse input folder '%s': %s\n", FOLDER_IN, err)
-		}
-		fmt.Println("Found following epubs as input: ", files)
-		parseAndAddBooks(&books, files, true)
+		// Books in the import folder are candidates; a book is considered
+		// finished once its epub has been copied next to the audio in the output
+		// folder (that copy is what marks it as done).
+		scanFolder(books, cfg, cfg.FolderIn, true)
+		scanFolder(books, cfg, cfg.FolderOut, false)
+		printBooks(books)
+		processBooks(books, cfg)
 
-		// Read output folder and parse books
-		// Every output folder has to contain the original epub file in order to be recognized
-		files, err = traverseAndFindEpub(FOLDER_OUT)
-		if err != nil {
-			fmt.Printf("Failed to traverse output folder '%s': %s\n", FOLDER_OUT, err)
-		}
-		fmt.Println("Found following epubs as output: ", files)
-		parseAndAddBooks(&books, files, false)
-
-		printBooks(&books)
-
-		processBooks(&books)
-
-		log.Println("Waiting for new files...")
-		time.Sleep(time.Hour * 1)
+		log.Printf("Waiting %s for new files...", cfg.PollInterval)
+		time.Sleep(cfg.PollInterval)
 	}
 }
 
-func processBooks(books *map[string]Book) {
-	for epub, book := range *books {
-		if book.Status == New {
-			// Process new book and wait for it to finish
-			_tmp := strings.Split(epub, ".")
-			bookName := strings.Join(_tmp[:len(_tmp)-1], ".")
-			bookFolder := filepath.Join(FOLDER_OUT, bookName)
+// processBooks converts every book that has not been converted yet, one after
+// another: audiblez is CPU bound and one book at a time keeps the log readable.
+func processBooks(books map[string]*Book, cfg config) {
+	for name, book := range books {
+		if book.Status != New {
+			continue
+		}
+		if cfg.MaxAttempts > 0 && book.Attempts >= cfg.MaxAttempts {
+			log.Printf("Skipping '%s': already failed %d times (last error: %s)", name, book.Attempts, book.LastError)
+			continue
+		}
+		book.Attempts++
+		book.Status = InProcess
+		log.Printf("Processing book '%s' (attempt %d)...", name, book.Attempts)
+		if err := convertBook(book, cfg); err != nil {
+			book.Status = Error
+			book.LastError = err.Error()
+			log.Printf("Book '%s' failed: %v", name, err)
+			continue
+		}
+		book.Status = Done
+		book.Progress = 100
+		book.TimeRemaining = ""
+		log.Printf("Finished book '%s'", name)
+	}
+}
 
-			log.Printf("Processing book '%s' ...\n", bookName)
-			result_folder, err := runAudiblezOnEpub(book)
-			if err != nil {
-				fmt.Printf("failed to process book: %s\n", err)
-				continue
+// convertBook selects the chapters, runs audiblez on a derived epub holding only
+// those chapters and writes title named audio to the output folder.
+func convertBook(book *Book, cfg config) error {
+	bookFolder := filepath.Join(cfg.FolderOut, strings.TrimSuffix(book.BookName, filepath.Ext(book.BookName)))
+
+	workDir := filepath.Join(os.TempDir(), "audiobookconverter",
+		time.Now().Format("2006-01-02_15_04_05"), sanitizeFileName(book.BookName))
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return fmt.Errorf("could not create work directory %s: %w", workDir, err)
+	}
+	defer os.RemoveAll(filepath.Dir(workDir))
+
+	epub, err := openEpub(book.EpubPath)
+	if err != nil {
+		return err
+	}
+	filter := chapterFilter{
+		MinTextChars: cfg.MinTextChars,
+		SkipPatterns: cfg.SkipPatterns,
+		KeepPatterns: cfg.KeepPatterns,
+	}
+	chapters := epub.selectedChapters(filter)
+	if len(chapters) == 0 {
+		return fmt.Errorf("no readable chapters found in %s", book.EpubPath)
+	}
+	log.Printf("'%s' by %s: %d chapters", epub.meta.Title, epub.meta.Creator, len(chapters))
+	for i, ch := range chapters {
+		log.Printf("  %d. %s (%d characters)", i+1, ch.Title, ch.charCount())
+	}
+
+	names, err := epub.writeDerivedEpub(filepath.Join(workDir, derivedEpubName), chapters)
+	if err != nil {
+		return fmt.Errorf("could not build the chapter only epub: %w", err)
+	}
+	log.Printf("Running audiblez on %s (voice %s) -> %s", derivedEpubName, cfg.Voice, names[0])
+
+	status := &conversionStatus{}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				pct, eta := status.snapshot()
+				log.Printf("'%s': progress %d%%, remaining %s", book.BookName, pct, eta)
 			}
+		}
+	}()
+	audiblezErr := runAudiblez(workDir, cfg, status)
+	close(done)
+	pct, eta := status.snapshot()
+	book.Progress = pct
+	book.TimeRemaining = eta
+	if audiblezErr != nil {
+		// audiblez still writes the wav files of every chapter it managed to
+		// synthesise; the m4b step in particular fails on ffmpeg builds without
+		// libfdk_aac. Keep whatever audio exists.
+		log.Printf("%v - converting the wav files that were produced", audiblezErr)
+	}
 
-			cmdFFMPEG := exec.Command("bash", "-c", "for f in ./*.wav; do ffmpeg -i $f -ac 2 -b:a 192k  ${f#*_xhtml_}.mp3 ; done")
-			cmdFFMPEG.Dir = result_folder
-			output, err := cmdFFMPEG.CombinedOutput()
-			if err != nil {
-				fmt.Println("Output:\n", string(output))
-				fmt.Println("Error while trying to convert audio files: ", err)
-			}
+	audio, err := collectChapterAudio(workDir, chapters, cfg.Bitrate)
+	if err != nil {
+		if audiblezErr != nil {
+			return fmt.Errorf("%w (audiblez: %v)", err, audiblezErr)
+		}
+		return err
+	}
+	if len(audio) < len(chapters) {
+		log.Printf("Only %d of %d chapters have audio", len(audio), len(chapters))
+	}
+	book.Chapters = len(audio)
 
-			moveFiles(result_folder, bookFolder, []string{".wav", ".txt"})
-
-			os.RemoveAll(result_folder)
+	if cfg.BuildM4B {
+		m4bName := strings.TrimSuffix(book.BookName, filepath.Ext(book.BookName)) + ".m4b"
+		if err := buildM4B(workDir, audio, epub.meta, m4bName, cfg.Bitrate); err != nil {
+			log.Printf("Could not create the single file audiobook: %v", err)
 		}
 	}
-}
 
-func printBooks(books *map[string]Book) {
-	for epub, book := range *books {
-		fmt.Println("File: ", epub, "\t Status: ", book.Status)
+	// The epub itself is copied into the output folder: it marks the book as
+	// converted on the next scan.
+	if err := os.MkdirAll(bookFolder, 0o755); err != nil {
+		return fmt.Errorf("could not create destination directory %s: %w", bookFolder, err)
 	}
+	if err := copyFile(book.EpubPath, filepath.Join(bookFolder, book.BookName)); err != nil {
+		return err
+	}
+	exclude := map[string]bool{
+		derivedEpubName:       true, // our intermediate epub
+		"cover":               true, // extracted by audiblez for its own m4b
+		"audiobookconcat.txt": true,
+		"chapters.ffmeta":     true,
+		"chapters.m4b":        true, // audiblez's own (unnamed) audiobook
+		"chapters.tmp.mp4":    true,
+	}
+	if err := moveFiles(workDir, bookFolder, exclude, []string{".wav", ".txt"}); err != nil {
+		return err
+	}
+	log.Printf("Audio written to %s", bookFolder)
+	return nil
 }
 
-func parseAndAddBooks(booksMap *map[string]Book, epubs []string, areBooksInImportFolder bool) {
-	for _, epub := range epubs {
-		// Get basename of the file
+// scanFolder registers the epub files of a folder as books.
+func scanFolder(books map[string]*Book, cfg config, folder string, isSource bool) {
+	files, err := traverseAndFindEpub(folder, cfg.MaxDepth)
+	if err != nil {
+		log.Printf("Failed to traverse '%s': %s", folder, err)
+		return
+	}
+	kind := "output"
+	if isSource {
+		kind = "input"
+	}
+	log.Printf("Found %d epub files in %s folder %s", len(files), kind, folder)
+	for _, epub := range files {
 		basename := filepath.Base(epub)
-		// Check whether book already exists
-		var bookEntry Book
-		if _, ok := (*booksMap)[basename]; ok {
-			bookEntry = (*booksMap)[basename]
+		book, ok := books[basename]
+		if !ok {
+			book = &Book{BookName: basename, EpubPath: epub, Status: Error}
+			books[basename] = book
+		}
+		if isSource {
+			book.SourceFolder = filepath.Dir(epub)
+			book.EpubPath = epub
+			book.Status = New
 		} else {
-			bookEntry.BookName = basename
-			bookEntry.EpubPath = epub
+			book.TargetFolder = filepath.Dir(epub)
 		}
-
-		if areBooksInImportFolder {
-			bookEntry.SourceFolder = filepath.Dir(epub)
-		} else {
-			bookEntry.TargetFolder = filepath.Dir(epub)
+		// A book whose epub also sits in the output folder has been converted.
+		if book.TargetFolder != "" {
+			book.Status = Done
+		} else if book.SourceFolder == "" {
+			book.Status = Error
 		}
-
-		bookEntry.Status = Error
-
-		if bookEntry.SourceFolder != "" {
-			bookEntry.Status = New
-		}
-		if bookEntry.TargetFolder != "" {
-			bookEntry.Status = Done
-		}
-
-		(*booksMap)[basename] = bookEntry
 	}
 }
 
-func performChecks() {
-	// Configure Viper for environment variables
+func printBooks(books map[string]*Book) {
+	for name, book := range books {
+		extra := ""
+		if book.Status == InProcess || book.Status == Done {
+			extra = fmt.Sprintf(" chapters: %d progress: %d%% remaining: %s", book.Chapters, book.Progress, book.TimeRemaining)
+		}
+		if book.Status == Error && book.LastError != "" {
+			extra = " reason: " + book.LastError
+		}
+		log.Printf("Book '%s' status: %s%s", name, book.Status, extra)
+	}
+}
+
+// defaultConfig is the configuration without any environment input.
+func defaultConfig() config {
+	patterns, err := compilePatterns(defaultSkipPatterns)
+	if err != nil {
+		log.Fatalf("Invalid default skip pattern: %v", err)
+	}
+	return config{
+		MaxDepth:     defaultMaxDepth,
+		Voice:        defaultVoice,
+		Speed:        1.0,
+		Bitrate:      defaultBitrate,
+		MinTextChars: defaultMinText,
+		BuildM4B:     true,
+		MaxAttempts:  defaultMaxTry,
+		PollInterval: time.Duration(defaultPollMins) * time.Minute,
+		SkipPatterns: patterns,
+	}
+}
+
+// loadConfig reads the environment and checks the tools we depend on.
+func loadConfig() config {
+	base := defaultConfig()
 	viper.AutomaticEnv()
 	viper.SetEnvPrefix(ENV_PREFIX)
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
-	// Retrieve folder paths from environment variables
-	FOLDER_IN = viper.GetString("in")
-	FOLDER_OUT = viper.GetString("out")
-	if viper.IsSet("max_depth") {
-		TRAVERSAL_MAX_DEPTH = viper.GetInt("max_depth")
+	viper.SetDefault("voice", base.Voice)
+	viper.SetDefault("bitrate", base.Bitrate)
+	viper.SetDefault("speed", base.Speed)
+	viper.SetDefault("max_depth", base.MaxDepth)
+	viper.SetDefault("min_text_chars", base.MinTextChars)
+	viper.SetDefault("max_attempts", base.MaxAttempts)
+	viper.SetDefault("m4b", base.BuildM4B)
+	viper.SetDefault("poll_minutes", int(base.PollInterval.Minutes()))
+
+	cfg := config{
+		FolderIn:     viper.GetString("in"),
+		FolderOut:    viper.GetString("out"),
+		MaxDepth:     viper.GetInt("max_depth"),
+		Voice:        viper.GetString("voice"),
+		Speed:        viper.GetFloat64("speed"),
+		Bitrate:      viper.GetString("bitrate"),
+		MinTextChars: viper.GetInt("min_text_chars"),
+		BuildM4B:     viper.GetBool("m4b"),
+		MaxAttempts:  viper.GetInt("max_attempts"),
+		PollInterval: time.Duration(viper.GetInt("poll_minutes")) * time.Minute,
+	}
+	// FOLDER_IN/FOLDER_OUT were the names used before the CONVERTER_ prefix was
+	// applied consistently; keep accepting them.
+	if cfg.FolderIn == "" {
+		cfg.FolderIn = os.Getenv("FOLDER_IN")
+	}
+	if cfg.FolderOut == "" {
+		cfg.FolderOut = os.Getenv("FOLDER_OUT")
+	}
+	if cfg.Speed < 0.5 || cfg.Speed > 2.0 {
+		log.Printf("Ignoring speed %v, must be between 0.5 and 2.0", cfg.Speed)
+		cfg.Speed = 1.0
 	}
 
-	// Log folder paths
-	log.Printf("%s_IN: %s\n", ENV_PREFIX, FOLDER_IN)
-	log.Printf("%s_OUT: %s\n", ENV_PREFIX, FOLDER_OUT)
-	log.Printf("%s_MAX_DEPTH: %d\n", ENV_PREFIX, TRAVERSAL_MAX_DEPTH)
-
-	// Validate folder paths
-	if FOLDER_IN == "" || FOLDER_OUT == "" {
-		log.Println("Error: At least one folder is not specified!")
-		os.Exit(1)
+	patterns := defaultSkipPatterns
+	if extra := viper.GetString("extra_skip_patterns"); extra != "" {
+		patterns = append(patterns, splitPatterns(extra)...)
+	}
+	var err error
+	if cfg.SkipPatterns, err = compilePatterns(patterns); err != nil {
+		log.Fatalf("Invalid skip pattern: %v", err)
+	}
+	if cfg.KeepPatterns, err = compilePatterns(splitPatterns(viper.GetString("keep_patterns"))); err != nil {
+		log.Fatalf("Invalid keep pattern: %v", err)
 	}
 
-	// Check if audiblez binary is available
-	if _, err := exec.LookPath("audiblez"); err != nil {
-		log.Fatal("Error: Could not find 'audiblez' executable: ", err)
-	}
+	log.Printf("%s_IN: %s", ENV_PREFIX, cfg.FolderIn)
+	log.Printf("%s_OUT: %s", ENV_PREFIX, cfg.FolderOut)
+	log.Printf("%s_MAX_DEPTH: %d, %s_VOICE: %s, %s_SPEED: %v, %s_BITRATE: %s",
+		ENV_PREFIX, cfg.MaxDepth, ENV_PREFIX, cfg.Voice, ENV_PREFIX, cfg.Speed, ENV_PREFIX, cfg.Bitrate)
+	log.Printf("%s_MIN_TEXT_CHARS: %d, %s_M4B: %v, %s_POLL_MINUTES: %v, %s_MAX_ATTEMPTS: %d",
+		ENV_PREFIX, cfg.MinTextChars, ENV_PREFIX, cfg.BuildM4B, ENV_PREFIX, cfg.PollInterval, ENV_PREFIX, cfg.MaxAttempts)
 
-	// Check if ffmpeg binary is available
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		log.Fatal("Note: Could not find 'ffmpeg' executable. Not going to ")
+	if cfg.FolderIn == "" || cfg.FolderOut == "" {
+		log.Fatalf("Error: %s_IN and %s_OUT must both be set", ENV_PREFIX, ENV_PREFIX)
 	}
-
+	for _, tool := range []string{"audiblez", "ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			log.Fatalf("Error: could not find the '%s' executable: %v", tool, err)
+		}
+	}
+	if err := os.MkdirAll(cfg.FolderOut, 0o755); err != nil {
+		log.Fatalf("Error: could not create %s_OUT: %v", ENV_PREFIX, err)
+	}
 	log.Println("All checks passed. Starting...")
+	return cfg
 }
 
-func runAudiblezOnEpub(book Book) (string, error) {
-
-	log.Println("Running for book: ", book)
-
-	tmpPath := "/tmp/audiobookconverter/" + time.Now().Format("2006-01-02_15_04_05")
-
-	source, err := os.Open(book.EpubPath)
-	if err != nil {
-		return "", fmt.Errorf("Could not read epub file: %s", err)
-	}
-	defer source.Close()
-
-	err = os.MkdirAll(tmpPath, os.ModePerm)
-	if err != nil {
-		return "", fmt.Errorf("Failed to create temp folder: %s", err)
-	}
-	destination, err := os.Create(tmpPath + "/book.epub")
-	if err != nil {
-		return "", fmt.Errorf("Could not create temp file: %s", err)
-	}
-	defer destination.Close()
-	_, err = io.Copy(destination, source)
-	if err != nil {
-		return "", fmt.Errorf("Failed to copy ebook to temp folder: %s", err)
-	}
-
-	cmd := exec.Command("audiblez", "-v", VOICE, "book.epub")
-	// stdor, stdow := io.Pipe()
-	// stder, stdew := io.Pipe()
-	// cmd.Stdout = stdow
-	// cmd.Stderr = stdew
-
-	// stdor, _ := cmd.StdoutPipe()
-	stder, _ := cmd.StderrPipe()
-
-	cmd.Dir = tmpPath
-
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("Failed to run command: %s", err)
-	}
-
-	// var wg sync.WaitGroup
-	// wg.Add(1)
-
-	// Goroutine to read and evaluate the command's output
-	// go func() {
-	// 	log.Println("Starting output reading...")
-	// 	defer wg.Done()
-	// 	reader := bufio.NewReader(stdor)
-
-	// 	var timeRemaining = ""
-	// 	var progress = ""
-	// 	for {
-	// 		log.Println("Scanned line...")
-	// 		_line, _, _ := reader.ReadLine()
-	// 		line := string(_line)
-	// 		log.Println("OUT: ", line)
-	// 		if err != nil {
-	// 			if err == io.EOF {
-	// 				break
-	// 			}
-	// 			log.Println("Failed to read line: ", err)
-	// 			continue
-	// 		}
-	// 		log.Println(line)
-	// 		if strings.HasPrefix(line, "Estimated time remaining") {
-	// 			timeRemaining = line[24:]
-	// 		} else if strings.HasPrefix(line, "Progress") {
-	// 			progress = line[10:]
-	// 		}
-	// 		log.Println("Current progress:", progress)
-	// 		log.Println("Remaining time:", timeRemaining)
-	// 	}
-
-	// 	fmt.Println("Finished output reading.")
-	// }()
-
-	// go func() {
-	// 	reader := bufio.NewReader(stder)
-	// 	for {
-	// 		line, _, _ := reader.ReadLine()
-	// 		log.Println("ERROR: ", string(line))
-	// 	}
-	// }()
-
-	// wg.Wait()
-
-	tmp, _ := io.ReadAll(stder)
-	// Wait for the command to finish
-	if err := cmd.Wait(); err != nil {
-		log.Printf("Command finished with error: %v\n#### OUTPUT ####\n%s", err, tmp)
-		log.Printf("Epub will be copied to prevent future retries.")
-	}
-
-	os.Rename(filepath.Join(tmpPath, "book.epub"), filepath.Join(tmpPath, book.BookName))
-
-	log.Printf("Finished book '%s' in '%s'\n", book.BookName, tmpPath)
-	return tmpPath, nil
-}
-
-// moveFiles moves all files from the source directory to the destination directory.
-// Parameters:
-//   - srcDir: The source directory path.
-//   - destDir: The destination directory path.
-//
-// Returns:
-//   - An error if the operation fails.
-func moveFiles(srcDir string, destDir string, excludeExtensions []string) error {
-	// Open the source directory
-	files, err := os.ReadDir(srcDir)
-
-	if err != nil {
-		return fmt.Errorf("failed to read source directory: %v", err)
-	}
-
-	// Ensure the destination directory exists
-	err = os.MkdirAll(destDir, os.ModePerm)
-	if err != nil {
-		return fmt.Errorf("failed to create destination directory: %v", err)
-	}
-
-	// Iterate over each file in the source directory
-	for _, file := range files {
-		srcPath := filepath.Join(srcDir, file.Name())
-		if slices.Contains(excludeExtensions, filepath.Ext(srcPath)) {
-			log.Println("Skipping file copy for: ", srcPath)
-			continue
+// splitPatterns splits a comma separated option list, allowing "\," to escape a
+// literal comma inside a regular expression.
+func splitPatterns(value string) []string {
+	var out []string
+	var cur strings.Builder
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			if i+1 < len(value) && value[i+1] == ',' {
+				i++
+				cur.WriteByte(',')
+				continue
+			}
+			cur.WriteByte(value[i])
+		case ',':
+			if s := strings.TrimSpace(cur.String()); s != "" {
+				out = append(out, s)
+			}
+			cur.Reset()
+		default:
+			cur.WriteByte(value[i])
 		}
-		destPath := filepath.Join(destDir, file.Name())
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
 
-		// log.Printf("Moving '%s' to '%s'", srcPath, destPath)
-
-		// Move the file
-		destination, err := os.Create(destPath)
+func compilePatterns(patterns []string) ([]*regexp.Regexp, error) {
+	var out []*regexp.Regexp
+	for _, p := range patterns {
+		re, err := regexp.Compile(`(?i)` + p)
 		if err != nil {
-			return fmt.Errorf("Could not create destination file: %s", err)
+			return nil, fmt.Errorf("%q: %w", p, err)
 		}
-		source, err := os.Open(srcPath)
-		if err != nil {
-			return fmt.Errorf("Could not open source file: %s", err)
-		}
-		defer destination.Close()
-		_, err = io.Copy(destination, source)
-		// if err != nil {
-		// 	return fmt.Errorf("failed to move file '%s' to '%s': %v", srcPath, destPath, err)
-		// }
+		out = append(out, re)
 	}
-
-	return nil
+	return out, nil
 }
 
-// traverseAndFindEpub traverses a given path to a specified depth and searches for files with an .epub extension.
-// Parameters:
-//   - path: The starting directory path.
-//   - TRAVERSAL_MAX_DEPTH: The maximum depth to traverse. Use -1 for unlimited depth.
-//
-// Returns:
-//   - A slice of strings containing the paths of all found .epub files.
-//   - An error if the traversal fails.
-func traverseAndFindEpub(path string) ([]string, error) {
+// traverseAndFindEpub finds .epub files below path, descending at most maxDepth
+// directory levels (maxDepth == -1 for no limit). Depth is counted relative to
+// path, not to the file system root.
+func traverseAndFindEpub(path string, maxDepth int) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	root := filepath.Clean(path)
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			// Nothing scanned yet: an absent folder is an empty one.
+			return nil, nil
+		}
+		return nil, err
+	}
 	var epubFiles []string
-
-	// Helper function to perform the traversal
-	traverse := func(currentPath string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(root, func(currentPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-
-		// Calculate current depth
-		currentDepth := strings.Count(currentPath, string(os.PathSeparator))
-
-		// Skip if the current depth exceeds TRAVERSAL_MAX_DEPTH (unless TRAVERSAL_MAX_DEPTH is -1)
-		if TRAVERSAL_MAX_DEPTH != -1 && currentDepth > TRAVERSAL_MAX_DEPTH {
-			return filepath.SkipDir
+		rel, err := filepath.Rel(root, currentPath)
+		if err != nil {
+			return err
 		}
-
-		// Check if the current file is an .epub file
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".epub") {
+		depth := 0
+		if rel != "." {
+			depth = strings.Count(rel, string(filepath.Separator)) + 1
+		}
+		if d.IsDir() {
+			if maxDepth != -1 && depth > maxDepth {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(strings.ToLower(d.Name()), ".epub") {
 			epubFiles = append(epubFiles, currentPath)
 		}
-
 		return nil
-	}
-
-	// Start traversal
-	err := filepath.Walk(path, traverse)
-
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to traverse directory: %v", err)
+		return nil, fmt.Errorf("failed to traverse directory: %w", err)
 	}
-
 	return epubFiles, nil
 }

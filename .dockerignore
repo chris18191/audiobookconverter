@@ -1,0 +1,4 @@
+# Books are mounted at runtime; they must not enter the build context.
+*.epub
+audiobookconverter
+*_test.go
