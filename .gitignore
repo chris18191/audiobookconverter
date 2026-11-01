@@ -3,3 +3,7 @@
 
 # Books are input, not source
 *.epub
+
+# Converted audiobooks (mp3/m4b are far over what git should hold)
+/out/
+*.m4b
