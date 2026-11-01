@@ -75,6 +75,12 @@ Escaping in the pattern lists: write `\,` for a comma inside a regexp.
 `audiblez`, `ffmpeg` and `ffprobe` must be on the `PATH`. The first conversion
 downloads the voice model of the configured voice.
 
+The docker image pins `audiblez==0.4.9`: the chapter audio is matched to audiblez's
+output file names, so a new audiblez release has to be checked against the test
+suite before the image takes it. Running the converter outside the image is not
+pinned; if audiblez changes its output naming there, the log says which chapters
+got no audio.
+
 ## Docker
 
 ```bash

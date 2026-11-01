@@ -8,9 +8,12 @@ RUN apt update \
 # a CPU only host. The CPU build of torch is installed first so that the CUDA
 # wheels are never considered. The voice model dependencies are large; without a
 # generous timeout the build dies on a slow mirror.
+# The audiblez version is pinned: the wrapper pairs audiblez's wav files with the
+# chapters by their file names, so an unannounced change upstream turns into
+# mislabelled or missing audio. Upgrading is a deliberate commit.
 RUN pip install --no-cache-dir --timeout 180 --retries 5 \
         --index-url https://download.pytorch.org/whl/cpu torch \
-    && pip install --no-cache-dir --timeout 180 --retries 5 audiblez
+    && pip install --no-cache-dir --timeout 180 --retries 5 audiblez==0.4.9
 
 WORKDIR /converter
 COPY go.mod go.sum ./
