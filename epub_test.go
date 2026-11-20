@@ -74,114 +74,10 @@ func TestSelectionOnShippedBook(t *testing.T) {
 	}
 }
 
-func TestDerivedEpubOnShippedBook(t *testing.T) {
-	if _, err := os.Stat(realBook); err != nil {
-		t.Skip("sample book not present")
-	}
-	b, err := openEpub(realBook)
-	if err != nil {
-		t.Fatalf("openEpub: %v", err)
-	}
-	chapters := b.selectedChapters(defaultFilter(t))
-	dir := t.TempDir()
-	dest := filepath.Join(dir, derivedEpubName)
-	names, err := b.writeDerivedEpub(dest, chapters)
-	if err != nil {
-		t.Fatalf("writeDerivedEpub: %v", err)
-	}
-	if len(names) != len(chapters) {
-		t.Fatalf("names %v", names)
-	}
-	if names[0] != "OEBPS/chapter_01.xhtml" {
-		t.Errorf("unexpected canonical name %q", names[0])
-	}
-	// The derived book must be readable and expose exactly the chapters.
-	derived, err := openEpub(dest)
-	if err != nil {
-		t.Fatalf("reopening derived epub: %v", err)
-	}
-	again := derived.selectedChapters(defaultFilter(t))
-	if len(again) != len(chapters) {
-		t.Fatalf("derived epub has %d chapters, want %d", len(again), len(chapters))
-	}
-	for i := range chapters {
-		if again[i].Title != chapters[i].Title {
-			t.Errorf("derived chapter %d: got %q want %q", i+1, again[i].Title, chapters[i].Title)
-		}
-	}
-	if derived.meta.Title != b.meta.Title {
-		t.Errorf("derived metadata title %q", derived.meta.Title)
-	}
-	if derived.coverID == "" {
-		t.Errorf("derived epub lost its cover")
-	}
-	info, err := os.Stat(dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("derived epub: %d bytes (original %d), first chapter %s",
-		info.Size(), mustSize(t, realBook), names[0])
-}
-
-func mustSize(t *testing.T, p string) int64 {
-	t.Helper()
-	st, err := os.Stat(p)
-	if err != nil {
-		return -1
-	}
-	return st.Size()
-}
-
-func TestDerivedEpubKeepsRelativeHrefs(t *testing.T) {
-	// The fixture keeps its package document inside OEBPS, like most books: the
-	// manifest and navMap hrefs of the derived book have to be relative to it.
-	dir := t.TempDir()
-	src := writeFixtureEpub(t, filepath.Join(dir, "Fix.epub"), true)
-	b, err := openEpub(src)
-	if err != nil {
-		t.Fatalf("openEpub: %v", err)
-	}
-	chapters := b.selectedChapters(defaultFilter(t))
-	if len(chapters) != 2 {
-		t.Fatalf("selected %d chapters, want 2", len(chapters))
-	}
-	dest := filepath.Join(dir, "derived.epub")
-	names, err := b.writeDerivedEpub(dest, chapters)
-	if err != nil {
-		t.Fatalf("writeDerivedEpub: %v", err)
-	}
-	if names[0] != "OEBPS/chapter_01.xhtml" {
-		t.Errorf("unexpected chapter name %q", names[0])
-	}
-	derived, err := openEpub(dest)
-	if err != nil {
-		t.Fatalf("reopen derived: %v", err)
-	}
-	if derived.ncxPath != "OEBPS/toc.ncx" {
-		t.Errorf("ncx path %q", derived.ncxPath)
-	}
-	again := derived.selectedChapters(defaultFilter(t))
-	if len(again) != 2 {
-		t.Fatalf("derived book has %d chapters, want 2", len(again))
-	}
-	for i := range again {
-		if again[i].Title != chapters[i].Title {
-			t.Errorf("chapter %d: got %q want %q", i, again[i].Title, chapters[i].Title)
-		}
-		// An href that does not resolve reads as an empty document: the text is
-		// what proves manifest, spine and navMap all point at the real file.
-		if again[i].charCount() < 1000 {
-			t.Errorf("chapter %d (%s) has %d characters", i+1, again[i].Title, again[i].charCount())
-		}
-	}
-	if derived.coverID == "" {
-		t.Errorf("derived epub lost its cover")
-	}
-}
-
 // TestChaptersOutsideThePackageDirectory covers books whose content lives in a
 // directory next to the one holding content.opf (a "Text/" folder beside
-// "OEBPS/"): the hrefs of those documents start with "..".
+// "OEBPS/"): the hrefs of those documents start with "..", and resolving them
+// wrong would read every chapter as an empty document.
 func TestChaptersOutsideThePackageDirectory(t *testing.T) {
 	dir := t.TempDir()
 	src := writeFixtureEpub(t, filepath.Join(dir, "src", "Book.epub"), true)
@@ -193,35 +89,20 @@ func TestChaptersOutsideThePackageDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := defaultFilter(t)
-	names, want := []string{}, []string{"Chapter One", "Chapter Two"}
-	for _, ch := range b.spine {
-		if keep, _ := b.keepChapter(ch, f); keep {
-			names = append(names, ch.Title)
+	sel := b.selectedChapters(f)
+	want := []string{"Chapter One", "Chapter Two"}
+	if len(sel) != len(want) {
+		t.Fatalf("chapters = %d, want %d", len(sel), len(want))
+	}
+	for i, w := range want {
+		if !strings.Contains(sel[i].Title, w) {
+			t.Errorf("chapter %d title = %q, want %q", i+1, sel[i].Title, w)
 		}
-	}
-	if len(names) != len(want) {
-		t.Fatalf("chapters = %v, want %v", names, want)
-	}
-
-	out := filepath.Join(dir, "derived.epub")
-	if _, err := b.writeDerivedEpub(out, b.selectedChapters(f)); err != nil {
-		t.Fatal(err)
-	}
-	// ebooklib reads the spine through the manifest hrefs: if they do not point
-	// at the entries that were written, the conversion produces silence.
-	got, err := openEpub(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got.spine) != len(want) {
-		t.Fatalf("derived spine = %d documents, want %d", len(got.spine), len(want))
-	}
-	for i, ch := range got.spine {
-		if ch.ZipPath == "" || ch.charCount() < 200 {
-			t.Errorf("derived chapter %d = path %q, %d characters", i+1, ch.ZipPath, ch.charCount())
-		}
-		if !strings.Contains(ch.Title, want[i]) {
-			t.Errorf("derived chapter %d title = %q, want %q", i+1, ch.Title, want[i])
+		// A document whose href does not resolve reads as empty: the text is
+		// what proves the manifest hrefs were followed correctly.
+		if sel[i].charCount() < 1000 {
+			t.Errorf("chapter %d (%s) reads as %d characters - \"..\" href lost",
+				i+1, sel[i].Title, sel[i].charCount())
 		}
 	}
 }
@@ -274,20 +155,6 @@ func relocateContent(t *testing.T, src, dest string) {
 }
 
 func TestHrefHelpers(t *testing.T) {
-	relCases := []struct{ dir, zip, want string }{
-		{"", "chapter_01.xhtml", "chapter_01.xhtml"},
-		{".", "OEBPS/chapter_01.xhtml", "OEBPS/chapter_01.xhtml"},
-		{"OEBPS", "OEBPS/chapter_01.xhtml", "chapter_01.xhtml"},
-		{"OEBPS", "Text/chapter_01.xhtml", "../Text/chapter_01.xhtml"},
-		{"A/B", "A/C/chapter_01.xhtml", "../C/chapter_01.xhtml"},
-		{"A/B/C", "A/B/C/D/chapter_01.xhtml", "D/chapter_01.xhtml"},
-	}
-	for _, c := range relCases {
-		if got := relHref(c.dir, c.zip); got != c.want {
-			t.Errorf("relHref(%q, %q) = %q, want %q", c.dir, c.zip, got, c.want)
-		}
-	}
-
 	joinCases := []struct{ base, href, want string }{
 		{"OEBPS", "c1.xhtml", "OEBPS/c1.xhtml"},
 		{"OEBPS", "../Text/c1.xhtml", "Text/c1.xhtml"},

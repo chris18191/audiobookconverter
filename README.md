@@ -1,13 +1,18 @@
 # Audiobook Converter
 
-A wrapper around [audiblez](https://github.com/santinic/audiblez) that watches an
-input folder, converts the EPUBs it finds into audiobooks, and writes the result
-to an output folder.
+Watches an input folder, converts the EPUBs it finds into audiobooks, and
+writes the result to an output folder. The speech comes from a local
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) engine
+([pure C inference](https://github.com/gabriele-mastrapasqua/qwen3-tts)):
+fully offline, good German and English voices, and the building blocks for
+expressive narration (per-segment speech rate, emotion and instructions on
+the 1.7 B models, voice cloning profiles).
 
-audiblez turns every readable document of an epub into speech. Left alone that
+TTS tools turn every readable document of an epub into speech. Left alone that
 means a book full of cover pages, tables of contents, copyright notices,
-glossaries and bibliographies - and audio files named `chapter_5_bm_lewis_OEBPS_c9H`.
-This wrapper therefore selects the chapters itself and names the audio after them.
+glossaries and bibliographies - and audio files with internal zip paths for
+names. This wrapper therefore selects the chapters itself, extracts their
+text and names the audio after them.
 
 ## What it does
 
@@ -25,17 +30,16 @@ For each `<Book>.epub` in the input folder:
    split in pieces), and documents too short to hold a chapter. For a book
    without any table of contents, length is the only clue, and a document with a
    chapter's worth of text is kept. The log lists every dropped document with
-   the reason. Everything audiblez needs to keep - the reading order and the
-   text - is untouched.
-3. **Build a chapters-only epub** (`chapter_01.xhtml`, `chapter_02.xhtml`, ...
-   in spine order, with the original metadata and cover, and without the images,
-   which are irrelevant for speech synthesis).
-4. **Run audiblez** on it, so the speech synthesis order is the chapter order by
-   construction.
-5. **Write one `<Book>.m4b`** holding the whole book, with the epub chapter
+   the reason.
+3. **Synthesize the chapters** in reading order with the engine: each chapter's
+   text is split into segments (paragraphs are never merged, sentences are
+   never cut), every segment is one request to a resident engine server that
+   loaded the model once, and the configured silence fills the gaps between
+   segments.
+4. **Write one `<Book>.m4b`** holding the whole book, with the epub chapter
    titles as chapter markers at the right offsets. No other audio file is
-   written: the chapter audio stays in the work directory.
-6. **Copy the source epub** into the book's folder in the output directory. That
+   written: intermediate audio stays in the work directory.
+5. **Copy the source epub** into the book's folder in the output directory. That
    copy is the marker of a finished book: the scanner never picks it up again as
    new work.
 
@@ -54,8 +58,7 @@ the input and output folders (`FOLDER_IN`, `FOLDER_OUT` still work).
 | --- | --- | --- |
 | `CONVERTER_IN` | - | Folder scanned for epub files |
 | `CONVERTER_OUT` | - | Folder the audiobooks are written to |
-| `CONVERTER_VOICE` | `bm_lewis` | audiblez voice (`audiblez --help` lists them) |
-| `CONVERTER_SPEED` | `1.0` | Speech speed, 0.5 - 2.0 |
+| `CONVERTER_SPEED` | `1.0` | Speech rate, 0.5 - 2.0 (pitch-preserving `rate` request field) |
 | `CONVERTER_BITRATE` | `192k` | Bitrate of the `.m4b` audio |
 | `CONVERTER_MAX_DEPTH` | `3` | How deep below `CONVERTER_IN` epubs are looked for (`-1` = unlimited) |
 | `CONVERTER_MIN_TEXT_CHARS` | `1000` | Text a document without any title needs to count as the continuation of the previous chapter |
@@ -66,49 +69,113 @@ the input and output folders (`FOLDER_IN`, `FOLDER_OUT` still work).
 
 Escaping in the pattern lists: write `\,` for a comma inside a regexp.
 
+### Speech engine
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CONVERTER_TTS_BIN` | `qwen_tts` | The engine executable (a bare name must be on the `PATH`) |
+| `CONVERTER_TTS_MODEL` | - | Model directory with `config.json` (required unless `TTS_URL` is set) |
+| `CONVERTER_TTS_URL` | - | Use a running engine server (`http://host:port`) instead of starting one |
+| `CONVERTER_TTS_SPEAKER` | `ryan` | Narrator voice (`qwen_tts -d <model> --list-speakers`) |
+| `CONVERTER_TTS_QUANTIZE` | `int8` | `int8` for a faster, smaller talker, `mixed-cpu` for the mixed-precision CPU build, empty for full precision |
+| `CONVERTER_TTS_MAX_CHARS` | `600` | Text budget per engine request, 120 - 1792; segmentation never splits a sentence or a quotation to honour it |
+| `CONVERTER_TTS_SILENCE_MS` | `500` | Quiet inserted between segments inside a chapter, 0 - 3000 |
+| `CONVERTER_TTS_THREADS` | `0` | Engine threads, `0` = engine default |
+| `CONVERTER_TTS_SEED` | `-1` | `>= 0` makes synthesis reproducible; `-1` lets the engine pick |
+| `CONVERTER_TTS_LANGUAGE` | `auto` | `auto`, `German` or `English` |
+| `CONVERTER_TTS_STARTUP_SECONDS` | `300` | Budget for the engine server to load the model |
+
+**Engine lifecycle.** The converter starts `qwen_tts --serve` as a child
+process, waits for its health check and stops it on exit - the weights load
+once per run, not once per chapter. If the server dies between segments the
+converter restarts it and retries the segment; books that are already done keep
+their audio. With `CONVERTER_TTS_URL` nothing is started and the server at that
+address is used as is (health-checked before every book); the binary and model
+options then refer to that machine and are not checked locally.
+
+**Language.** With `auto` the converter takes `dc:language` from the epub; if
+that is missing it decides from the text (German and English markers). A book
+whose metadata says one thing and whose text says another is narrated in the
+language of the text once the sample is decisive - the log always says which
+source decided.
+
+Each chapter is split into segments of at most `TTS_MAX_CHARS` characters.
+Every segment is synthesized with the same voice, rate and seed, so the chapter
+sounds like one recording; the configured silence fills the gaps.
+
 ## Requirements
 
-`audiblez`, `ffmpeg` and `ffprobe` must be on the `PATH`. The first conversion
-downloads the voice model of the configured voice.
+`ffmpeg` and `ffprobe` must be on the `PATH`, plus the engine: the `qwen_tts`
+executable (build it from the
+[engine repository](https://github.com/gabriele-mastrapasqua/qwen3-tts) with
+`make qwen_tts`, it needs gcc and OpenBLAS headers) and a downloaded model
+directory. The engine runs completely offline. If it was built against a
+private OpenBLAS, start the converter with that library on `LD_LIBRARY_PATH`,
+the child processes inherit it.
 
-The docker image pins `audiblez==0.4.9`: the chapter audio is matched to audiblez's
-output file names, so a new audiblez release has to be checked against the test
-suite before the image takes it. Running the converter outside the image is not
-pinned; if audiblez changes its output naming there, the log says which chapters
-got no audio.
+Model sizes: the 0.6 B model is the practical choice on a CPU-only machine
+(int8 measures at RTF ~1.1 on this laptop, a 10-hour novel converts
+overnight), the 1.7 B model is markedly better and the
+only one with the full emotion/instruct stack, but costs about twice the time
+per chapter. See `BENCHMARKS.md` for the measured numbers.
+
+## Trying it: the demo book
+
+`demo/` generates a small original German story as a proper epub - three
+chapters with narration and dialogue, enough text to exercise segmentation:
+
+```bash
+go build -o audiobookconverter .
+go run ./demo /tmp/books/demo-deutsch.epub
+
+CONVERTER_IN=/tmp/books CONVERTER_OUT=/tmp/audiobooks \
+CONVERTER_TTS_MODEL=/path/to/qwen3-tts-0.6b \
+./audiobookconverter
+```
+
+The log shows the chapter selection, the detected language and per-chapter
+segment counts; the result is `demo-deutsch/demo-deutsch.m4b` once the epub
+marker appears next to it.
 
 ## Docker
+
+The image builds the converter and the engine from source; the model weights
+are several gigabytes and are never part of the image. Mount the folder that
+holds them at `/models` (or point `CONVERTER_TTS_URL` at an engine server
+elsewhere).
 
 ```bash
 docker build -t audiobookconverter .
 docker run -d --name audiobookconverter \
-  -v /path/to/books:/books \
+  -v /path/to/books:/books:ro \
   -v /path/to/audiobooks:/audiobooks \
-  -v audiobookconverter-cache:/root/.cache \
+  -v /path/to/models/qwen3-tts-0.6b:/models:ro \
   -e CONVERTER_IN=/books -e CONVERTER_OUT=/audiobooks \
-  -e CONVERTER_VOICE=bm_lewis \
+  -e CONVERTER_TTS_MODEL=/models \
   audiobookconverter
 ```
 
-The cache volume keeps the voice model across container restarts.
+The engine image pins the engine commit: the wrapper speaks this exact server
+contract, so an upstream change is only taken after the test suite has been
+run against it.
 
 ### One book at a time
 
-`convert-epub.sh` starts a container for a single epub instead of watching a
-folder, shows the conversion log, and exits when the book is done:
+`convert-epub.sh` starts a container for the given epubs instead of watching a
+folder, shows the conversion log, and exits when every book is done:
 
 ```bash
+export ABC_MODEL_DIR=~/models/qwen3-tts-0.6b
 ./convert-epub.sh ~/Books/"The Secret Name.epub"
-./convert-epub.sh -o ~/Audiobooks -v bmGeorge --bitrate 128k ~/Books/*.epub
+./convert-epub.sh -o ~/Audiobooks --speaker vivian --bitrate 128k ~/Books/*.epub
 ```
 
 The audiobooks appear in the output folder (`.` by default), one subfolder per
-book. The voice model is kept in the `audiobookconverter-models` docker volume,
-so it is downloaded once. A book whose folder in the output already holds its
-epub is reported as converted and left alone. `--help` lists the options,
-`--dry-run` prints the `docker run` command instead of running it, `--build`
-builds the image first. The files are written by root inside the container, so
-they may be owned by root on the host.
+book. A book whose folder in the output already holds its epub is reported as
+converted and left alone. `--help` lists the options, `--dry-run` prints the
+`docker run` command instead of running it, `--build` builds the image first.
+The files are written by root inside the container, so they may be owned by
+root on the host.
 
 ## Development
 
@@ -118,5 +185,6 @@ go test ./...
 ```
 
 The test suite covers the chapter selection (rules plus the shipped reference
-book), the derived epub, and the audio pipeline end to end against a stub of
-audiblez, so no voice model download is needed.
+book), the language detection, the segmenter, and the audio pipeline end to
+end against a fake engine server, so no model download is needed. The tests
+that assemble audio need `ffmpeg` and skip themselves without it.

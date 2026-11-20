@@ -5,13 +5,11 @@ import (
 	"io/fs"
 	"log"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
+	"syscall"
 	"time"
-
-	"github.com/spf13/viper"
 )
 
 type ProcessingState int
@@ -45,59 +43,24 @@ type Book struct {
 	LastError     string
 }
 
-const (
-	ENV_PREFIX = "CONVERTER"
-
-	defaultVoice    = "bm_lewis"
-	defaultBitrate  = "192k"
-	defaultMinText  = 1000
-	defaultMaxDepth = 3
-	defaultMaxTry   = 3
-	defaultPollMins = 60
-)
-
-// defaultSkipPatterns are matched case insensitively against a chapter's title.
-// They cover the structural and back matter that must not be narrated; a book
-// that names a real chapter after one of these words can be rescued with
-// CONVERTER_KEEP_PATTERNS.
-var defaultSkipPatterns = []string{
-	`^(table of )?contents$`,
-	`^toc$`,
-	`^(references?|bibliography|works cited|end ?notes|source notes)\b`,
-	`^glossary\b`,
-	`^index$`,
-	`^(copyright|©)\b`,
-	`^(colophon|imprimatur)\b`,
-	`^(title ?page|half ?title|series page)\b`,
-	`^(also by|more by|by the same author)\b`,
-	`^acknowledg`,
-	`^about the (author|editor|translator|illustrator|photographer)\b`,
-	`^(a )?note on\b`,
-	`^(praise for|advance praise)\b`,
-	`^(advertisement|advertisements|also available|promotion)\b`,
-	`^(dedication|epigraph)\b`,
-	`^publisher'?s? (note|information)\b`,
-	`\bbook series$`,
-	`^(errata|corrections)$`,
-}
-
-type config struct {
-	FolderIn     string
-	FolderOut    string
-	MaxDepth     int
-	Voice        string
-	Speed        float64
-	Bitrate      string
-	MinTextChars int
-	SkipPatterns []*regexp.Regexp
-	KeepPatterns []*regexp.Regexp
-	MaxAttempts  int
-	PollInterval time.Duration
-}
-
 func main() {
 	cfg := loadConfig()
 	books := make(map[string]*Book)
+
+	// The engine server outlives a single book (its warm weights are the
+	// whole point) but must not outlive the converter: on Ctrl+C or systemd
+	// stop, kill the child first so it cannot linger as an orphan with the
+	// model loaded.
+	eng := newTTSEngine(cfg)
+	defer eng.stop()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigs
+		log.Printf("Received %s, stopping...", sig)
+		eng.stop()
+		os.Exit(0)
+	}()
 
 	for {
 		// Books in the import folder are candidates; a book is considered
@@ -106,7 +69,7 @@ func main() {
 		scanFolder(books, cfg, cfg.FolderIn, true)
 		scanFolder(books, cfg, cfg.FolderOut, false)
 		printBooks(books)
-		processBooks(books, cfg)
+		processBooks(books, cfg, eng)
 
 		log.Printf("Waiting %s for new files...", cfg.PollInterval)
 		time.Sleep(cfg.PollInterval)
@@ -114,8 +77,9 @@ func main() {
 }
 
 // processBooks converts every book that has not been converted yet, one after
-// another: audiblez is CPU bound and one book at a time keeps the log readable.
-func processBooks(books map[string]*Book, cfg config) {
+// another: synthesis is CPU bound and one book at a time keeps the log
+// readable.
+func processBooks(books map[string]*Book, cfg config, eng *ttsEngine) {
 	for name, book := range books {
 		if book.Status != New {
 			continue
@@ -127,7 +91,7 @@ func processBooks(books map[string]*Book, cfg config) {
 		book.Attempts++
 		book.Status = InProcess
 		log.Printf("Processing book '%s' (attempt %d)...", name, book.Attempts)
-		if err := convertBook(book, cfg); err != nil {
+		if err := convertBook(book, cfg, eng); err != nil {
 			book.Status = Error
 			book.LastError = err.Error()
 			log.Printf("Book '%s' failed: %v", name, err)
@@ -140,9 +104,9 @@ func processBooks(books map[string]*Book, cfg config) {
 	}
 }
 
-// convertBook selects the chapters, runs audiblez on a derived epub holding only
-// those chapters and writes title named audio to the output folder.
-func convertBook(book *Book, cfg config) error {
+// convertBook selects the chapters, synthesizes them with the engine and
+// writes title named audio to the output folder.
+func convertBook(book *Book, cfg config, eng *ttsEngine) error {
 	bookFolder := filepath.Join(cfg.FolderOut, strings.TrimSuffix(book.BookName, filepath.Ext(book.BookName)))
 
 	workDir := filepath.Join(os.TempDir(), "audiobookconverter",
@@ -170,12 +134,6 @@ func convertBook(book *Book, cfg config) error {
 		log.Printf("  %d. %s (%d characters)", i+1, ch.Title, ch.charCount())
 	}
 
-	names, err := epub.writeDerivedEpub(filepath.Join(workDir, derivedEpubName), chapters)
-	if err != nil {
-		return fmt.Errorf("could not build the chapter only epub: %w", err)
-	}
-	log.Printf("Running audiblez on %s (voice %s) -> %s", derivedEpubName, cfg.Voice, names[0])
-
 	status := &conversionStatus{}
 	done := make(chan struct{})
 	go func() {
@@ -191,37 +149,14 @@ func convertBook(book *Book, cfg config) error {
 			}
 		}
 	}()
-	audiblezErr := runAudiblez(workDir, cfg, status)
+	var audio []chapterAudio
+	audio, err = eng.synthesize(workDir, epub, chapters, status)
 	close(done)
 	pct, eta := status.snapshot()
 	book.Progress = pct
 	book.TimeRemaining = eta
-	if audiblezErr != nil {
-		// audiblez still writes the wav files of every chapter it managed to
-		// synthesise, and a chapter that is long enough to have taken minutes is
-		// worth keeping; whether that is the whole book is decided below.
-		log.Printf("%v - converting the wav files that were produced", audiblezErr)
-	}
-
-	audio, err := collectChapters(workDir, chapters)
 	if err != nil {
-		if audiblezErr != nil {
-			return fmt.Errorf("%w (audiblez: %v)", err, audiblezErr)
-		}
 		return err
-	}
-	if len(audio) < len(chapters) {
-		if audiblezErr != nil {
-			// audiblez died in the middle of the synthesis. Shipping the first
-			// third of the book as if it were the whole book is worse than
-			// retrying it on the next scan, and the converted marker is only
-			// written when this returns without error.
-			return fmt.Errorf("audiblez stopped after %d of %d chapters: %w",
-				len(audio), len(chapters), audiblezErr)
-		}
-		// audiblez itself skipped the rest (no speech could be generated for
-		// them); keep what exists and say which chapters are missing.
-		log.Printf("Only %d of %d chapters have audio", len(audio), len(chapters))
 	}
 	book.Chapters = len(audio)
 
@@ -237,12 +172,7 @@ func convertBook(book *Book, cfg config) error {
 		return fmt.Errorf("could not create destination directory %s: %w", bookFolder, err)
 	}
 	exclude := map[string]bool{
-		derivedEpubName:       true, // our intermediate epub
-		"cover":               true, // extracted by audiblez for its own m4b
-		"audiobookconcat.txt": true,
-		"chapters.ffmeta":     true,
-		"chapters.m4b":        true, // audiblez's own (unnamed) audiobook
-		"chapters.tmp.mp4":    true,
+		"chapters.ffmeta": true, // buildM4B's own metadata file
 	}
 	if err := moveFiles(workDir, bookFolder, exclude, []string{".wav", ".txt"}); err != nil {
 		return err
@@ -309,138 +239,6 @@ func printBooks(books map[string]*Book) {
 		}
 		log.Printf("Book '%s' status: %s%s", name, book.Status, extra)
 	}
-}
-
-// defaultConfig is the configuration without any environment input.
-func defaultConfig() config {
-	patterns, err := compilePatterns(defaultSkipPatterns)
-	if err != nil {
-		log.Fatalf("Invalid default skip pattern: %v", err)
-	}
-	return config{
-		MaxDepth:     defaultMaxDepth,
-		Voice:        defaultVoice,
-		Speed:        1.0,
-		Bitrate:      defaultBitrate,
-		MinTextChars: defaultMinText,
-		MaxAttempts:  defaultMaxTry,
-		PollInterval: time.Duration(defaultPollMins) * time.Minute,
-		SkipPatterns: patterns,
-	}
-}
-
-// loadConfig reads the environment and checks the tools we depend on.
-func loadConfig() config {
-	base := defaultConfig()
-	viper.AutomaticEnv()
-	viper.SetEnvPrefix(ENV_PREFIX)
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-
-	viper.SetDefault("voice", base.Voice)
-	viper.SetDefault("bitrate", base.Bitrate)
-	viper.SetDefault("speed", base.Speed)
-	viper.SetDefault("max_depth", base.MaxDepth)
-	viper.SetDefault("min_text_chars", base.MinTextChars)
-	viper.SetDefault("max_attempts", base.MaxAttempts)
-	viper.SetDefault("poll_minutes", int(base.PollInterval.Minutes()))
-
-	cfg := config{
-		FolderIn:     viper.GetString("in"),
-		FolderOut:    viper.GetString("out"),
-		MaxDepth:     viper.GetInt("max_depth"),
-		Voice:        viper.GetString("voice"),
-		Speed:        viper.GetFloat64("speed"),
-		Bitrate:      viper.GetString("bitrate"),
-		MinTextChars: viper.GetInt("min_text_chars"),
-		MaxAttempts:  viper.GetInt("max_attempts"),
-		PollInterval: time.Duration(viper.GetInt("poll_minutes")) * time.Minute,
-	}
-	// FOLDER_IN/FOLDER_OUT were the names used before the CONVERTER_ prefix was
-	// applied consistently; keep accepting them.
-	if cfg.FolderIn == "" {
-		cfg.FolderIn = os.Getenv("FOLDER_IN")
-	}
-	if cfg.FolderOut == "" {
-		cfg.FolderOut = os.Getenv("FOLDER_OUT")
-	}
-	if cfg.Speed < 0.5 || cfg.Speed > 2.0 {
-		log.Printf("Ignoring speed %v, must be between 0.5 and 2.0", cfg.Speed)
-		cfg.Speed = 1.0
-	}
-
-	patterns := defaultSkipPatterns
-	if extra := viper.GetString("extra_skip_patterns"); extra != "" {
-		patterns = append(patterns, splitPatterns(extra)...)
-	}
-	var err error
-	if cfg.SkipPatterns, err = compilePatterns(patterns); err != nil {
-		log.Fatalf("Invalid skip pattern: %v", err)
-	}
-	if cfg.KeepPatterns, err = compilePatterns(splitPatterns(viper.GetString("keep_patterns"))); err != nil {
-		log.Fatalf("Invalid keep pattern: %v", err)
-	}
-
-	log.Printf("%s_IN: %s", ENV_PREFIX, cfg.FolderIn)
-	log.Printf("%s_OUT: %s", ENV_PREFIX, cfg.FolderOut)
-	log.Printf("%s_MAX_DEPTH: %d, %s_VOICE: %s, %s_SPEED: %v, %s_BITRATE: %s",
-		ENV_PREFIX, cfg.MaxDepth, ENV_PREFIX, cfg.Voice, ENV_PREFIX, cfg.Speed, ENV_PREFIX, cfg.Bitrate)
-	log.Printf("%s_MIN_TEXT_CHARS: %d, %s_POLL_MINUTES: %v, %s_MAX_ATTEMPTS: %d",
-		ENV_PREFIX, cfg.MinTextChars, ENV_PREFIX, cfg.PollInterval, ENV_PREFIX, cfg.MaxAttempts)
-
-	if cfg.FolderIn == "" || cfg.FolderOut == "" {
-		log.Fatalf("Error: %s_IN and %s_OUT must both be set", ENV_PREFIX, ENV_PREFIX)
-	}
-	for _, tool := range []string{"audiblez", "ffmpeg", "ffprobe"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			log.Fatalf("Error: could not find the '%s' executable: %v", tool, err)
-		}
-	}
-	if err := os.MkdirAll(cfg.FolderOut, 0o755); err != nil {
-		log.Fatalf("Error: could not create %s_OUT: %v", ENV_PREFIX, err)
-	}
-	log.Println("All checks passed. Starting...")
-	return cfg
-}
-
-// splitPatterns splits a comma separated option list, allowing "\," to escape a
-// literal comma inside a regular expression.
-func splitPatterns(value string) []string {
-	var out []string
-	var cur strings.Builder
-	for i := 0; i < len(value); i++ {
-		switch value[i] {
-		case '\\':
-			if i+1 < len(value) && value[i+1] == ',' {
-				i++
-				cur.WriteByte(',')
-				continue
-			}
-			cur.WriteByte(value[i])
-		case ',':
-			if s := strings.TrimSpace(cur.String()); s != "" {
-				out = append(out, s)
-			}
-			cur.Reset()
-		default:
-			cur.WriteByte(value[i])
-		}
-	}
-	if s := strings.TrimSpace(cur.String()); s != "" {
-		out = append(out, s)
-	}
-	return out
-}
-
-func compilePatterns(patterns []string) ([]*regexp.Regexp, error) {
-	var out []*regexp.Regexp
-	for _, p := range patterns {
-		re, err := regexp.Compile(`(?i)` + p)
-		if err != nil {
-			return nil, fmt.Errorf("%q: %w", p, err)
-		}
-		out = append(out, re)
-	}
-	return out, nil
 }
 
 // traverseAndFindEpub finds .epub files below path, descending at most maxDepth

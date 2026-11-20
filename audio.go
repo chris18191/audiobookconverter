@@ -1,28 +1,22 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
-// conversionStatus is updated from the audiblez output while it runs.
+// conversionStatus is the progress of the book that is converting right now.
 type conversionStatus struct {
-	mu        sync.Mutex
-	percent   int
-	eta       string
-	processed int
-	total     int
-	lastLog   time.Time
+	mu      sync.Mutex
+	percent int
+	eta     string
 }
 
 func (s *conversionStatus) set(percent int, eta string) {
@@ -38,162 +32,15 @@ func (s *conversionStatus) snapshot() (int, string) {
 	return s.percent, s.eta
 }
 
-var (
-	etaRE      = regexp.MustCompile(`Estimated time remaining[^:]*:\s*(.+?)\s*$`)
-	progressRE = regexp.MustCompile(`Progress:\s*(\d+)\s*%`)
-)
-
-// scan folds one line of audiblez output into the status and reports whether the
-// line was progress information. Everything else belongs in the log.
-func (s *conversionStatus) scan(line string) bool {
-	if m := etaRE.FindStringSubmatch(line); m != nil {
-		percent, _ := s.snapshot()
-		s.set(percent, m[1])
-		return true
-	}
-	if m := progressRE.FindStringSubmatch(line); m != nil {
-		percent, err := strconv.Atoi(m[1])
-		if err == nil {
-			_, eta := s.snapshot()
-			s.set(percent, eta)
-		}
-		return true
-	}
-	return false
-}
-
-// runAudiblez converts the derived epub into one wav file per chapter. Progress
-// lines are folded into status instead of flooding the log; everything else is
-// logged verbatim.
-func runAudiblez(workDir string, cfg config, status *conversionStatus) error {
-	// audiblez names its wav files after the epub file name, so the derived name
-	// must be passed as argument, not an absolute path.
-	args := []string{"-v", cfg.Voice, "-s", formatSpeed(cfg.Speed), "-o", ".", derivedEpubName}
-	cmd := exec.Command("audiblez", args...)
-	cmd.Dir = workDir
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("could not attach to audiblez stdout: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("could not attach to audiblez stderr: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("could not start audiblez: %w", err)
-	}
-
-	var wg sync.WaitGroup
-	read := func(r io.Reader) {
-		defer wg.Done()
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			if status.scan(line) {
-				continue
-			}
-			log.Printf("audiblez: %s", line)
-		}
-		if err := sc.Err(); err != nil {
-			log.Printf("audiblez output could not be read: %v", err)
-		}
-	}
-	wg.Add(2)
-	go read(stdout)
-	go read(stderr)
-	wg.Wait()
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("audiblez failed: %w", err)
-	}
-	return nil
-}
-
-func formatSpeed(speed float64) string {
-	return strconv.FormatFloat(speed, 'f', -1, 64)
-}
-
-// derivedWavRE matches the wav file names audiblez produces for our derived
-// epub: chapters_chapter_<audiblez index>_<voice>_<sanitised path>.wav with the
-// sanitised path ending in the canonical chapter name we wrote.
-var derivedWavRE = regexp.MustCompile(`^chapters_chapter_(\d+)_(.+)_chapter_(\d+)\.[A-Za-z0-9]+\.wav$`)
-
-// wavFallbackRE is used if audiblez ever changes the trailing part of its file
-// names: the leading counter is then the only hint of the order, and audiblez
-// counts its own chapters, so the pairing of file and title is a guess.
-var wavFallbackRE = regexp.MustCompile(`^chapters_chapter_(\d+)_.*\.wav$`)
-
-// collectChapters maps the wav files audiblez wrote onto our chapters. The wavs
-// are the input of buildM4B; they are never written to the output folder, so no
-// intermediate mp3 exists (and the audio is encoded once instead of twice).
-func collectChapters(workDir string, chapters []epubChapter) ([]chapterAudio, error) {
-	entries, err := os.ReadDir(workDir)
-	if err != nil {
-		return nil, fmt.Errorf("could not read work directory: %w", err)
-	}
-	byNumber := map[int]string{}
-	byIndex := map[int]string{}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".wav") {
-			continue
-		}
-		if m := derivedWavRE.FindStringSubmatch(e.Name()); m != nil {
-			idx, _ := strconv.Atoi(m[1])
-			num, _ := strconv.Atoi(m[3])
-			byNumber[num] = e.Name()
-			byIndex[idx] = e.Name()
-			continue
-		}
-		if m := wavFallbackRE.FindStringSubmatch(e.Name()); m != nil {
-			idx, _ := strconv.Atoi(m[1])
-			if _, ok := byIndex[idx]; !ok {
-				byIndex[idx] = e.Name()
-			}
-		}
-	}
-
-	out := make([]chapterAudio, 0, len(chapters))
-	seen := map[string]bool{}
-	for i, ch := range chapters {
-		name, ok := byNumber[i+1]
-		if !ok {
-			// Fall back to audiblez's own counter. It skips empty chapters, so
-			// the mapping degrades instead of mislabelling the audio.
-			name, ok = byIndex[i+1]
-			if ok {
-				log.Printf("chapter %d (%s) matched by the audiblez counter, not by name: %s",
-					i+1, ch.Title, name)
-			}
-		}
-		if !ok || seen[name] {
-			log.Printf("no audio was produced for chapter %d (%s)", i+1, ch.Title)
-			continue
-		}
-		seen[name] = true
-		out = append(out, chapterAudio{
-			Title:    ch.Title,
-			File:     name,
-			Duration: probeDuration(filepath.Join(workDir, name)),
-		})
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("audiblez produced no chapter audio in %s", workDir)
-	}
-	return out, nil
-}
-
-// chapterAudio is one chapter of the book, in reading order, as audiblez wrote it.
+// chapterAudio is one chapter of the book, in reading order, as the engine
+// wrote it.
 type chapterAudio struct {
 	Title    string
 	File     string // the wav file, relative to the work directory
 	Duration float64
 }
 
+// probeDuration returns the playable length of an audio file in seconds.
 func probeDuration(file string) float64 {
 	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1", file)
@@ -208,10 +55,10 @@ func probeDuration(file string) float64 {
 	return d
 }
 
-// buildM4B concatenates the chapter wavs into a single chaptered .m4b. audiblez
-// builds its own m4b with the libfdk_aac encoder, which the ffmpeg build of the
-// Debian slim images does not provide, so relying on it would silently leave us
-// without an audiobook file - and with "Chapter 0/1/2" as chapter titles.
+// buildM4B concatenates the chapter wavs into a single chaptered .m4b. The
+// encoder is the ffmpeg-native aac: the Debian slim images do not provide
+// libfdk_aac, so relying on it would silently leave us without an audiobook
+// file - and with "Chapter 0/1/2" as chapter titles.
 func buildM4B(workDir string, chapters []chapterAudio, meta bookMetadata, destName, bitrate string) error {
 	listPath := filepath.Join(workDir, "audiobookconcat.txt")
 	metaPath := filepath.Join(workDir, "chapters.ffmeta")

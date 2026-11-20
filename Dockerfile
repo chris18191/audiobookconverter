@@ -1,33 +1,38 @@
-FROM python:3.12-slim-bookworm
-
-RUN apt update \
-    && apt install -y --no-install-recommends ffmpeg espeak-ng wget \
-    && rm -rf /var/lib/apt/lists/*
-# audiblez pulls in torch, and the default PyPI torch wheel drags the whole CUDA
-# stack (cublas, cudnn, nccl, triton: several gigabytes) into the image even on
-# a CPU only host. The CPU build of torch is installed first so that the CUDA
-# wheels are never considered. The voice model dependencies are large; without a
-# generous timeout the build dies on a slow mirror.
-# The audiblez version is pinned: the wrapper pairs audiblez's wav files with the
-# chapters by their file names, so an unannounced change upstream turns into
-# mislabelled or missing audio. Upgrading is a deliberate commit.
-RUN pip install --no-cache-dir --timeout 180 --retries 5 \
-        --index-url https://download.pytorch.org/whl/cpu torch \
-    && pip install --no-cache-dir --timeout 180 --retries 5 audiblez==0.4.9
-
-WORKDIR /converter
+# The converter is built with Go; the speech engine is built from source with
+# gcc. Both are dropped into a slim runtime that only adds ffmpeg.
+FROM golang:1.26-bookworm AS converter
+WORKDIR /src
 COPY go.mod go.sum ./
-RUN wget -q https://go.dev/dl/go1.25.6.linux-amd64.tar.gz \
-    && rm -rf /usr/local/go && tar -C /usr/local -xzf go1.25.6.linux-amd64.tar.gz \
-    && rm go1.25.6.linux-amd64.tar.gz
-RUN /usr/local/go/bin/go mod download
+RUN go mod download
 COPY . .
-RUN /usr/local/go/bin/go build .
-RUN mv /converter/audiobookconverter /opt/
-WORKDIR /opt/
-RUN rm -rf /converter
+RUN CGO_ENABLED=0 go build -o /audiobookconverter .
+
+# Pure C Qwen3-TTS engine. The commit is pinned: the wrapper talks HTTP to this
+# exact server contract, and an unannounced change upstream turns into failed
+# conversions. Bumping it is a deliberate commit, checked against the test
+# suite before the image takes it.
+FROM debian:bookworm-slim AS engine
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git ca-certificates libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+ARG QWEN_TTS_COMMIT=ef339be58a778b062e1c14382347964552eae007
+RUN git clone https://github.com/gabriele-mastrapasqua/qwen3-tts /engine \
+    && cd /engine \
+    && git checkout "$QWEN_TTS_COMMIT" \
+    && make -j"$(nproc)" qwen_tts
+
+FROM debian:bookworm-slim
+# ffmpeg assembles the chapters; the engine needs its BLAS runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg libopenblas0 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=engine /engine/qwen_tts /usr/local/bin/qwen_tts
+COPY --from=converter /audiobookconverter /opt/
 
 ENV FOLDER_IN=/books
 ENV FOLDER_OUT=/audiobooks
+# The model weights are several gigabytes: they are never baked into the image
+# but mounted here (see convert-epub.sh --model).
+ENV CONVERTER_TTS_MODEL=/models
 
 CMD ["/opt/audiobookconverter"]

@@ -8,39 +8,23 @@ import (
 	"io"
 	"log"
 	"net/url"
-	"os"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	nethtml "golang.org/x/net/html"
 )
 
-// audiblez 0.4.9 only treats a document as a chapter when its *file name* looks
-// like one (audiblez/core.py: is_chapter -> "chapter", /part_\d+/, /split_\d+/,
-// /ch_\d+/, /chap_\d+/). Calibre exports use obfuscated names (c9H.xhtml,
-// cTZ.xhtml, ...), so for such a book nothing matches except the split-off
-// bibliography (c2WT_split_000.xhtml): the whole book is skipped and only the
-// references are narrated.
-//
-// So we select the chapters ourselves (spine + table of contents + text
-// density) and hand audiblez a derived epub containing exactly those chapters,
-// stored under canonical names ("chapter_01.xhtml" ...) that audiblez always
-// recognises, listed in manifest order in the same reading order (audiblez
-// iterates book.get_items(), i.e. OPF manifest order, not spine order).
+// The converter selects the chapters itself (spine + table of contents + text
+// density): the synthesis engine receives the extracted chapter texts, so a
+// book whose files carry obfuscated Calibre names (c9H.xhtml, cTZ.xhtml, ...)
+// works as well as one with sane naming. What still has to be kept out of the
+// narration is front matter, table of contents pages and references.
+const minChapterChars = 100 // documents below this text length are not chapters
 
-// derivedEpubName is the epub audiblez is run on; audiblez derives its wav file
-// names from it: chapters_chapter_<n>_<voice>_<sanitised path>.wav
-const derivedEpubName = "chapters.epub"
-
-// audiblezMinChapterChars is the text length audiblez itself requires before it
-// writes audio for a chapter (core.py: is_chapter / "Skipping empty chapter").
-const audiblezMinChapterChars = 100
-
-// htmlTextTags mirrors the tags audiblez extracts speech from, so that our
-// "is there enough text here" test agrees with what audiblez will synthesise.
+// htmlTextTags are the tags whose text counts as narratable speech, so that
+// the "is there enough text here" test agrees with what gets synthesised.
 var htmlTextTags = map[string]bool{
 	"p": true, "h1": true, "h2": true, "h3": true, "h4": true, "li": true,
 }
@@ -89,8 +73,8 @@ type epubChapter struct {
 	LinkChars  int
 }
 
-// charCount counts characters, the way audiblez measures the text it has to
-// speak (Python len()), not bytes.
+// charCount counts the chapter text in runes, not bytes: it is the size the
+// chapter heuristics judge, in what will be spoken.
 func (c *epubChapter) charCount() int { return utf8.RuneCountInString(c.Text) }
 
 // named reports whether the chapter has a human readable title to name the
@@ -120,7 +104,6 @@ type epubBook struct {
 	spine     []*epubChapter // documents in reading order
 	ncxPath   string         // path of the book's NCX inside the zip, if any
 	hasTOC    bool           // the book has a table of contents with entries
-	coverID   string
 }
 
 // openEpub reads container, package document and table of contents, and returns
@@ -172,8 +155,8 @@ func openEpub(p string) (*epubBook, error) {
 			continue // the EPUB3 nav document is a table of contents
 		}
 		if seen[zipPath] {
-			// A spine that lists the same document twice would have audiblez
-			// speak the section twice.
+			// A spine that lists the same document twice would narrate the
+			// section twice.
 			log.Printf("'%s' is referenced by the spine more than once: narrating it once", zipPath)
 			continue
 		}
@@ -209,7 +192,6 @@ func openEpub(p string) (*epubBook, error) {
 		}
 		b.spine = append(b.spine, ch)
 	}
-	b.coverID = b.detectCover()
 	return b, nil
 }
 
@@ -257,9 +239,8 @@ func (b *epubBook) parsePackage(opf []byte) error {
 	if len(b.spineIDs) == 0 {
 		return fmt.Errorf("no spine items in %s", b.opfPath)
 	}
-	if b.meta.Language == "" {
-		b.meta.Language = "en"
-	}
+	// A missing dc:language stays empty on purpose: bookLanguage then decides
+	// the spoken language from the text instead of inheriting a silent default.
 	return nil
 }
 
@@ -517,7 +498,7 @@ type htmlAnalysis struct {
 	LinkChars int
 }
 
-// analyseHTML extracts the spoken text (audiblez's tag set), the first heading,
+// analyseHTML extracts the spoken text, the first heading,
 // the <title>, the EPUB3 roles and how much of the text is link text.
 func analyseHTML(raw []byte) htmlAnalysis {
 	a := htmlAnalysis{Roles: map[string]bool{}}
@@ -608,7 +589,7 @@ func (b *epubBook) keepChapter(ch *epubChapter, f chapterFilter) (bool, string) 
 			return false, "epub:type=" + role
 		}
 	}
-	if ch.charCount() < audiblezMinChapterChars {
+	if ch.charCount() < minChapterChars {
 		return false, "too little text"
 	}
 	if matchAny(f.SkipPatterns, ch.Title) {
@@ -652,155 +633,7 @@ func matchAny(pats []*regexp.Regexp, s string) bool {
 	return false
 }
 
-// --- derived epub ---------------------------------------------------------
-
-// chapterFileName builds the canonical name for chapter number index (1 based)
-// of total: "chapter_01.xhtml", kept in the directory of the original document
-// so that relative stylesheet and image references still resolve.
-func chapterFileName(origZipPath string, index, total int) string {
-	width := 2
-	if d := len(strconv.Itoa(total)); d > width {
-		width = d
-	}
-	ext := path.Ext(origZipPath)
-	if ext == "" {
-		ext = ".xhtml"
-	}
-	name := fmt.Sprintf("chapter_%0*d%s", width, index, ext)
-	if dir := path.Dir(origZipPath); dir != "." && dir != "" {
-		return dir + "/" + name
-	}
-	return name
-}
-
-// writeDerivedEpub writes an epub holding only the given chapters, named
-// chapter_01.xhtml ... in reading order, with manifest and spine in that same
-// order, plus the cover image and the non-image assets. Everything else is
-// dropped: images are irrelevant for speech synthesis.
-func (b *epubBook) writeDerivedEpub(dest string, chapters []epubChapter) ([]string, error) {
-	zr, err := zip.OpenReader(b.path)
-	if err != nil {
-		return nil, err
-	}
-	defer zr.Close()
-
-	out, err := os.Create(dest)
-	if err != nil {
-		return nil, fmt.Errorf("could not create %s: %w", dest, err)
-	}
-	zw := zip.NewWriter(out)
-	fail := func(err error) ([]string, error) {
-		zw.Close()
-		out.Close()
-		os.Remove(dest)
-		return nil, err
-	}
-
-	write := func(name string, data []byte, method uint16) error {
-		w, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: method})
-		if err != nil {
-			return err
-		}
-		_, err = w.Write(data)
-		return err
-	}
-
-	// 1. mimetype: first entry, stored.
-	mimetype := []byte("application/epub+zip")
-	if raw, err := readZipEntry(&zr.Reader, "mimetype"); err == nil && len(raw) > 0 {
-		mimetype = raw
-	}
-	if err := write("mimetype", mimetype, zip.Store); err != nil {
-		return fail(err)
-	}
-
-	// 2. chapters under their canonical names.
-	names := make([]string, len(chapters))
-	for i, ch := range chapters {
-		names[i] = chapterFileName(ch.ZipPath, i+1, len(chapters))
-	}
-	for i, ch := range chapters {
-		src, err := readZipEntry(&zr.Reader, ch.ZipPath)
-		if err != nil {
-			return fail(err)
-		}
-		if err := write(names[i], src, zip.Deflate); err != nil {
-			return fail(err)
-		}
-	}
-
-	// 3. assets (style sheets, fonts, cover) and META-INF.
-	keptPath := make(map[string]bool, len(chapters))
-	for _, ch := range chapters {
-		keptPath[ch.ZipPath] = true
-	}
-	// A stray member of the zip that carries one of the canonical names (and is
-	// not referenced by the package) must not be copied over the chapter we
-	// generated under that name: a zip with two entries of one name is broken.
-	generated := make(map[string]bool, len(names))
-	for _, n := range names {
-		generated[n] = true
-	}
-	ncxPath := b.ncxPath
-	if ncxPath == "" {
-		ncxPath = path.Join(b.opfDir, "toc.ncx")
-	}
-	regenerated := map[string]bool{
-		"mimetype":  true,
-		b.opfPath:   true,
-		ncxPath:     true,
-		b.navPath(): true,
-	}
-	for _, f := range zr.File {
-		if regenerated[f.Name] || keptPath[f.Name] || generated[f.Name] {
-			continue
-		}
-		if item, ok := b.itemByPath(f.Name); ok {
-			if isDocument(item) {
-				continue // skipped front/back matter, or a renamed chapter
-			}
-			if strings.HasPrefix(item.MediaType, "image/") && item.ID != b.coverID {
-				continue
-			}
-		}
-		src, err := func() ([]byte, error) {
-			rc, err := f.Open()
-			if err != nil {
-				return nil, err
-			}
-			defer rc.Close()
-			return io.ReadAll(rc)
-		}()
-		if err != nil {
-			return fail(err)
-		}
-		if err := write(f.Name, src, f.Method); err != nil {
-			return fail(err)
-		}
-	}
-
-	// 4. generated NCX (the derived book stays navigable) and package document.
-	ncx, err := b.renderNCX(chapters, names, ncxPath)
-	if err != nil {
-		return fail(err)
-	}
-	if err := write(ncxPath, ncx, zip.Deflate); err != nil {
-		return fail(err)
-	}
-	opf, err := b.renderOPF(chapters, names, ncxPath)
-	if err != nil {
-		return fail(err)
-	}
-	if err := write(b.opfPath, opf, zip.Deflate); err != nil {
-		return fail(err)
-	}
-	if err := zw.Close(); err != nil {
-		out.Close()
-		os.Remove(dest)
-		return nil, err
-	}
-	return names, out.Close()
-}
+// --- navigation -----------------------------------------------------------
 
 // navPath is the zip path of the EPUB3 nav document, or "".
 func (b *epubBook) navPath() string {
@@ -812,159 +645,10 @@ func (b *epubBook) navPath() string {
 	return ""
 }
 
-// renderOPF reuses the original <package> tag and <metadata> element and writes
-// a manifest and spine listing the kept chapters in reading order.
-func (b *epubBook) renderOPF(chapters []epubChapter, names []string, ncxPath string) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.WriteString(xml.Header)
-	if len(b.packageEl) > 0 {
-		buf.Write(b.packageEl)
-	} else {
-		buf.WriteString(`<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">`)
-	}
-	buf.WriteByte('\n')
-	if len(b.metadata) > 0 {
-		buf.Write(b.metadata)
-		buf.WriteByte('\n')
-	} else {
-		fmt.Fprintf(&buf, "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>%s</dc:title></metadata>\n",
-			xmlEscape(b.meta.Title))
-	}
-	buf.WriteString("<manifest>\n")
-	fmt.Fprintf(&buf, "  <item id=\"ncx\" href=\"%s\" media-type=\"application/x-dtbncx+xml\"/>\n",
-		xmlEscape(relHref(b.opfDir, ncxPath)))
-	for i, name := range names {
-		// The manifest hrefs are relative to the package document, not to the
-		// root of the container.
-		fmt.Fprintf(&buf, "  <item id=\"chapter%02d\" href=\"%s\" media-type=\"application/xhtml+xml\"/>\n",
-			i+1, xmlEscape(relHref(b.opfDir, name)))
-	}
-	if item, ok := b.item(b.coverID); ok {
-		attrs := fmt.Sprintf(" id=\"%s\" href=\"%s\" media-type=\"%s\"",
-			xmlEscape(item.ID), xmlEscape(item.Href), xmlEscape(item.MediaType))
-		// properties="cover-image" has to survive or an EPUB3 reader loses it.
-		if item.Properties != "" {
-			attrs += fmt.Sprintf(" properties=\"%s\"", xmlEscape(item.Properties))
-		}
-		fmt.Fprintf(&buf, "  <item%s/>\n", attrs)
-	}
-	for _, it := range b.items {
-		if isDocument(it) || it.ID == b.coverID || it.ID == "ncx" ||
-			it.MediaType == "application/x-dtbncx+xml" ||
-			strings.Contains(it.Properties, "nav") {
-			continue
-		}
-		if strings.HasPrefix(it.MediaType, "image/") {
-			continue // images are irrelevant for speech synthesis
-		}
-		attrs := fmt.Sprintf(" id=\"%s\" href=\"%s\" media-type=\"%s\"",
-			xmlEscape(it.ID), xmlEscape(it.Href), xmlEscape(it.MediaType))
-		if it.Properties != "" {
-			attrs += fmt.Sprintf(" properties=\"%s\"", xmlEscape(it.Properties))
-		}
-		fmt.Fprintf(&buf, "  <item%s/>\n", attrs)
-	}
-	buf.WriteString("</manifest>\n<spine toc=\"ncx\">\n")
-	for i := range chapters {
-		fmt.Fprintf(&buf, "  <itemref idref=\"chapter%02d\"/>\n", i+1)
-	}
-	buf.WriteString("</spine>\n</package>\n")
-	return buf.Bytes(), nil
-}
-
-// renderNCX writes a minimal EPUB2 navMap carrying the chapter titles, so the
-// derived epub exposes the same titles and order as the audio files.
-func (b *epubBook) renderNCX(chapters []epubChapter, names []string, ncxPath string) ([]byte, error) {
-	uid := b.meta.Identifier
-	if uid == "" {
-		uid = "urn:uuid:audiobookconverter"
-	}
-	var buf bytes.Buffer
-	buf.WriteString(xml.Header)
-	fmt.Fprintf(&buf, "<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\" xml:lang=\"%s\">\n",
-		xmlEscape(b.meta.Language))
-	buf.WriteString("<head>\n")
-	fmt.Fprintf(&buf, "  <meta name=\"dtb:uid\" content=\"%s\"/>\n", xmlEscape(uid))
-	buf.WriteString("  <meta name=\"dtb:depth\" content=\"1\"/>\n")
-	buf.WriteString("  <meta name=\"dtb:generator\" content=\"audiobookconverter\"/>\n")
-	buf.WriteString("</head>\n<docTitle><text>")
-	buf.Write(xmlEscapeBytes(b.meta.Title))
-	buf.WriteString("</text></docTitle>\n<navMap>\n")
-	ncxDir := path.Dir(ncxPath)
-	for i, ch := range chapters {
-		fmt.Fprintf(&buf, "  <navPoint id=\"chapter%02d\" playOrder=\"%d\"><navLabel><text>", i+1, i+1)
-		buf.Write(xmlEscapeBytes(ch.Title))
-		fmt.Fprintf(&buf, "</text></navLabel><content src=\"%s\"/></navPoint>\n",
-			xmlEscape(relHref(ncxDir, names[i])))
-	}
-	buf.WriteString("</navMap>\n</ncx>\n")
-	return buf.Bytes(), nil
-}
-
-func (b *epubBook) detectCover() string {
-	for _, it := range b.items {
-		if strings.Contains(it.Properties, "cover-image") {
-			return it.ID
-		}
-	}
-	re := regexp.MustCompile(`(?i)<meta[^>]+name=["']cover["'][^>]+content=["']([^"']+)["']`)
-	if m := re.FindSubmatch(b.metadata); m != nil {
-		return string(m[1])
-	}
-	for _, it := range b.items {
-		if strings.HasPrefix(it.MediaType, "image/") && strings.Contains(strings.ToLower(it.ID), "cover") {
-			return it.ID
-		}
-	}
-	return ""
-}
-
-func (b *epubBook) item(id string) (manifestItem, bool) {
-	if id == "" {
-		return manifestItem{}, false
-	}
-	for _, it := range b.items {
-		if it.ID == id {
-			return it, true
-		}
-	}
-	return manifestItem{}, false
-}
-
-func (b *epubBook) itemByPath(zipPath string) (manifestItem, bool) {
-	for _, it := range b.items {
-		if joinHref(b.opfDir, it.Href) == zipPath {
-			return it, true
-		}
-	}
-	return manifestItem{}, false
-}
-
 // --- helpers --------------------------------------------------------------
 
 func isDocument(it manifestItem) bool {
 	return it.MediaType == "application/xhtml+xml" || it.MediaType == "text/html"
-}
-
-// relHref expresses a zip path as an href relative to dir. Manifest and navMap
-// hrefs are resolved against the directory of their own document, not against
-// the root of the container, so a book whose package sits in OEBPS must not be
-// told to look for OEBPS/OEBPS/chapter_01.xhtml. Documents outside that
-// directory (a Text/ folder next to OEBPS/) are reached with "..".
-func relHref(dir, zipPath string) string {
-	if dir == "" || dir == "." {
-		return zipPath
-	}
-	// Climb out of dir up to the directory the two paths share, then walk down
-	// again: "OEBPS" -> "Text/x.xhtml" is "../Text/x.xhtml", "A/B" ->
-	// "A/C/x.xhtml" is "../C/x.xhtml".
-	dirs := strings.Split(dir, "/")
-	parts := strings.Split(zipPath, "/")
-	shared := 0
-	for shared < len(dirs) && shared < len(parts)-1 && dirs[shared] == parts[shared] {
-		shared++
-	}
-	return strings.Repeat("../", len(dirs)-shared) + strings.Join(parts[shared:], "/")
 }
 
 // joinHref resolves an href against the directory of the document it comes from
@@ -1199,14 +883,4 @@ func roleSet(n *nethtml.Node) map[string]bool {
 // squashSpace collapses whitespace runs into single spaces.
 func squashSpace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
-}
-
-func xmlEscape(s string) string { return string(xmlEscapeBytes(s)) }
-
-func xmlEscapeBytes(s string) []byte {
-	var buf bytes.Buffer
-	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
-		return []byte(s)
-	}
-	return buf.Bytes()
 }

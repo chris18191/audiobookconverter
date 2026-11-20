@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -96,33 +95,23 @@ func TestBooksAreRetriedOnlyUpToMaxAttempts(t *testing.T) {
 	src := filepath.Join(dir, "in")
 	out := filepath.Join(dir, "out")
 	fixture := writeFixtureEpub(t, filepath.Join(src, "Broken Book.epub"), true)
-
-	// An audiblez that fails without producing anything.
-	if _, err := exec.LookPath("python3"); err == nil {
-		bin := filepath.Join(dir, "bin")
-		if err := os.MkdirAll(bin, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		script := "#!/bin/sh\necho 'simulated failure' >&2\nexit 1\n"
-		if err := os.WriteFile(filepath.Join(bin, "audiblez"), []byte(script), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	} else if _, err := exec.LookPath("audiblez"); err != nil {
-		t.Skip("neither audiblez nor python3 available")
-	}
 	_ = fixture
 
 	cfg := defaultConfig()
 	cfg.FolderIn = src
 	cfg.FolderOut = out
 	cfg.MaxAttempts = 2
+	// An external engine server that is not there: every conversion attempt
+	// fails at the health check.
+	cfg.TTSURL = "http://127.0.0.1:1/"
+	eng := newTTSEngine(cfg)
+	defer eng.stop()
 
 	books := map[string]*Book{}
 	for round := 1; round <= 3; round++ {
 		scanFolder(books, cfg, cfg.FolderIn, true)
 		scanFolder(books, cfg, cfg.FolderOut, false)
-		processBooks(books, cfg)
+		processBooks(books, cfg, eng)
 		book := books["Broken Book.epub"]
 		if book == nil {
 			t.Fatalf("round %d: book not registered", round)

@@ -37,165 +37,6 @@ func TestSanitizeFileName(t *testing.T) {
 	}
 }
 
-func TestConversionStatusScan(t *testing.T) {
-	st := &conversionStatus{}
-	if !st.scan("Estimated time remaining (assuming 90 chars/sec): 00d 04h 12m 30s") {
-		t.Error("eta line was not recognised")
-	}
-	if percent, eta := st.snapshot(); eta != "00d 04h 12m 30s" || percent != 0 {
-		t.Errorf("snapshot = %d%%, %q", percent, eta)
-	}
-	if !st.scan("Progress: 42%") {
-		t.Error("progress line was not recognised")
-	}
-	if percent, eta := st.snapshot(); percent != 42 || eta != "00d 04h 12m 30s" {
-		t.Errorf("snapshot = %d%%, %q", percent, eta)
-	}
-	// Lines we do not understand must not disturb the state.
-	if st.scan("Downloading kokoro model") {
-		t.Error("unknown line reported as progress")
-	}
-	if percent, eta := st.snapshot(); percent != 42 || eta != "00d 04h 12m 30s" {
-		t.Errorf("unknown line changed state: %d%%, %q", percent, eta)
-	}
-	// The eta format of the pypi release (which is what pip installs).
-	other := &conversionStatus{}
-	other.scan("Estimated time remaining: 1h 2m 3s")
-	if _, eta := other.snapshot(); eta != "1h 2m 3s" {
-		t.Errorf("eta = %q", eta)
-	}
-}
-
-// fakeAudiblez writes a stub that produces one wav per spine document, named
-// exactly like audiblez names its output, using the argument list it was called
-// with. The wavs are sine tones of increasing length, so tests can check that
-// chapters end up in the right order with the right titles.
-func fakeAudiblez(t *testing.T, argsFile string) {
-	t.Helper()
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not available")
-	}
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not available")
-	}
-	dir := t.TempDir()
-	script := `#!/usr/bin/env python3
-import os, re, subprocess, sys, zipfile
-args = sys.argv[1:]
-with open(os.environ["FAKE_ARGS_FILE"], "w") as fh:
-    fh.write("\n".join(args))
-epub = [a for a in args if a.endswith(".epub")][-1]
-voice = args[args.index("-v") + 1]
-base = os.path.splitext(os.path.basename(epub))[0]
-with zipfile.ZipFile(epub) as z:
-    opf = [n for n in z.namelist() if n.endswith(".opf")][0]
-    text = z.read(opf).decode("utf-8", "replace")
-    prefix = os.path.dirname(opf)
-    manifest = dict(re.findall(r'<item[^>]*\bid="([^"]+)"[^>]*\bhref="([^"]+)"', text))
-    manifest.update(dict((m[1], m[0]) for m in re.findall(r'<item[^>]*\bhref="([^"]+)"[^>]*\bid="([^"]+)"', text)))
-    idrefs = re.findall(r'<itemref[^>]*idref="([^"]+)"', text)
-    index = 0
-    for idref in idrefs:
-        href = manifest.get(idref)
-        if href is None:
-            continue
-        name = os.path.normpath(os.path.join(prefix, href)) if prefix else href
-        if not name.lower().endswith((".xhtml", ".html", ".xml")) or name.endswith((".ncx",)):
-            continue
-        index += 1
-        out = "%s_chapter_%d_%s_%s.wav" % (base, index, voice, name.replace("/", "_"))
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
-                        "-i", "sine=frequency=200:duration=%.1f" % (0.5 + index * 0.5),
-                        "-ar", "24000", "-ac", "1", out], check=True)
-        print("Progress: %d%%" % (index * 100 // max(index, len(idrefs))))
-        stop = os.environ.get("FAKE_STOP_AFTER")
-        if stop and index >= int(stop):
-            print("simulated death in the middle of the synthesis", file=sys.stderr)
-            sys.exit(1)
-print("Estimated time remaining: 00d 00h 00m 01s")
-`
-	path := filepath.Join(dir, "audiblez")
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("FAKE_ARGS_FILE", argsFile)
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-func TestConvertBookEndToEnd(t *testing.T) {
-	cfg, src, out, fixture := endToEndFixture(t)
-	argsFile := os.Getenv("FAKE_ARGS_FILE")
-
-	b := &Book{EpubPath: fixture, BookName: "Fixture Book.epub", SourceFolder: src}
-	if err := convertBook(b, cfg); err != nil {
-		t.Fatalf("convertBook: %v", err)
-	}
-	if b.Chapters != 2 {
-		t.Errorf("book.Chapters = %d, want 2", b.Chapters)
-	}
-
-	bookDir := filepath.Join(out, "Fixture Book")
-	var names []string
-	entries, err := os.ReadDir(bookDir)
-	if err != nil {
-		t.Fatalf("read output: %v", err)
-	}
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	want := []string{"Fixture Book.epub", "Fixture Book.m4b"}
-	if len(names) != len(want) {
-		t.Fatalf("output = %v, want %v", names, want)
-	}
-	for i := range want {
-		if names[i] != want[i] {
-			t.Errorf("output %d = %q, want %q", i, names[i], want[i])
-		}
-	}
-
-	// audiblez has to be called with the epub named "chapters.epub": it derives
-	// its wav file names from it, and the wav to chapter mapping depends on that.
-	rawArgs, err := os.ReadFile(argsFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	args := string(rawArgs)
-	if !strings.Contains(args, "chapters.epub") || !strings.Contains(args, "test_voice") {
-		t.Errorf("unexpected audiblez arguments: %q", args)
-	}
-	if strings.Contains(args, fixture) {
-		t.Errorf("audiblez was called with the absolute epub path: %q", args)
-	}
-
-	// The m4b has to carry the chapter names, at the right offsets.
-	chs := probeChapters(t, filepath.Join(bookDir, "Fixture Book.m4b"))
-	if len(chs) != 2 {
-		t.Fatalf("m4b has %d chapters: %+v", len(chs), chs)
-	}
-	if chs[0].Title != "Chapter One" || chs[1].Title != "Chapter Two" {
-		t.Errorf("m4b chapter titles = %q, %q", chs[0].Title, chs[1].Title)
-	}
-	// The fake audio is 1.0s + 1.5s long.
-	if d := chs[1].Start; d < 0.9 || d > 1.1 {
-		t.Errorf("second chapter starts at %.3fs, want ~1.0s", d)
-	}
-	total := probeDurationOf(t, filepath.Join(bookDir, "Fixture Book.m4b"))
-	if total < 2.3 || total > 2.7 {
-		t.Errorf("m4b duration %.3fs, want ~2.5s", total)
-	}
-
-	// The source epub is copied as the finished marker.
-	if fi, err := os.Stat(filepath.Join(bookDir, "Fixture Book.epub")); err != nil || fi.Size() == 0 {
-		t.Errorf("finished epub missing: %v", err)
-	}
-	// Nothing left behind in the work directory.
-	if _, err := os.Stat(filepath.Join(os.TempDir(), "audiobookconverter")); err == nil {
-		if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), "audiobookconverter", "*", "Fixture Book", "*.wav")); len(leftovers) > 0 {
-			t.Errorf("wav files left behind: %v", leftovers)
-		}
-	}
-}
-
 type chapterProbe struct {
 	Title string
 	Start float64
@@ -255,9 +96,10 @@ func requireFFMpeg(t *testing.T) {
 	}
 }
 
-// endToEndFixture sets up an input folder with the fixture book, a stub audiblez
-// and the matching config.
-func endToEndFixture(t *testing.T) (cfg config, src, out, fixture string) {
+// endToEndFixture sets up an input folder with the fixture book and an engine
+// server that answers every segment with a one second sine wav. Silence
+// between segments is off so the assembled durations are exact.
+func endToEndFixture(t *testing.T) (cfg config, src, out, fixture string, eng *ttsEngine, fake *fakeEngine) {
 	t.Helper()
 	requireFFMpeg(t)
 	dir := t.TempDir()
@@ -270,28 +112,113 @@ func endToEndFixture(t *testing.T) (cfg config, src, out, fixture string) {
 		t.Fatal(err)
 	}
 	fixture = writeFixtureEpub(t, filepath.Join(src, "Fixture Book.epub"), true)
-	fakeAudiblez(t, filepath.Join(dir, "args"))
+	fake, srv := newFakeEngine(t)
 	cfg = defaultConfig()
 	cfg.FolderIn = src
 	cfg.FolderOut = out
-	cfg.Voice = "test_voice"
+	cfg.TTSSpeaker = "test_voice"
+	cfg.TTSURL = srv.URL
+	cfg.TTSMaxChars = 4000 // one segment per paragraph: predictable durations
+	cfg.TTSSilenceMS = 0
 	cfg.Bitrate = "64k"
+	eng = newTTSEngine(cfg)
+	t.Cleanup(eng.stop)
 	return
+}
+
+func TestConvertBookEndToEnd(t *testing.T) {
+	cfg, src, out, fixture, eng, fake := endToEndFixture(t)
+
+	b := &Book{EpubPath: fixture, BookName: "Fixture Book.epub", SourceFolder: src}
+	if err := convertBook(b, cfg, eng); err != nil {
+		t.Fatalf("convertBook: %v", err)
+	}
+	if b.Chapters != 2 {
+		t.Errorf("book.Chapters = %d, want 2", b.Chapters)
+	}
+
+	bookDir := filepath.Join(out, "Fixture Book")
+	var names []string
+	entries, err := os.ReadDir(bookDir)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	want := []string{"Fixture Book.epub", "Fixture Book.m4b"}
+	if len(names) != len(want) {
+		t.Fatalf("output = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("output %d = %q, want %q", i, names[i], want[i])
+		}
+	}
+
+	// The engine must have seen one request per segment, all for the
+	// configured narrator, and never the file path of the source epub.
+	reqs := fake.requestLog()
+	if len(reqs) < 2 {
+		t.Fatalf("engine saw %d requests, want at least one per chapter", len(reqs))
+	}
+	n1, n2 := 0, 0
+	for _, req := range reqs {
+		if req.Speaker != "test_voice" {
+			t.Errorf("request speaker = %q", req.Speaker)
+		}
+		if strings.Contains(req.Text, fixture) || strings.HasSuffix(req.Text, ".epub") {
+			t.Errorf("engine was sent a file path: %q", req.Text)
+		}
+		if strings.Contains(req.Text, "First the world") || strings.Contains(req.Text, "Chapter One") {
+			n1++
+		}
+		if strings.Contains(req.Text, "Learning is a prediction") || strings.Contains(req.Text, "Chapter Two") {
+			n2++
+		}
+	}
+	if n1 == 0 || n2 == 0 {
+		t.Fatalf("the chapters did not reach the engine as expected: %d/%d segments", n1, n2)
+	}
+
+	// The m4b has to carry the chapter names, at the right offsets. Every
+	// segment is one second long, so chapter two starts after n1 seconds.
+	chs := probeChapters(t, filepath.Join(bookDir, "Fixture Book.m4b"))
+	if len(chs) != 2 {
+		t.Fatalf("m4b has %d chapters: %+v", len(chs), chs)
+	}
+	if chs[0].Title != "Chapter One" || chs[1].Title != "Chapter Two" {
+		t.Errorf("m4b chapter titles = %q, %q", chs[0].Title, chs[1].Title)
+	}
+	if start, want := chs[1].Start, float64(n1); start < want-0.2 || start > want+0.2 {
+		t.Errorf("second chapter starts at %.3fs, want ~%.1fs", start, want)
+	}
+	total := probeDurationOf(t, filepath.Join(bookDir, "Fixture Book.m4b"))
+	if want := float64(n1 + n2); total < want-0.3 || total > want+0.3 {
+		t.Errorf("m4b duration %.3fs, want ~%.1fs", total, want)
+	}
+
+	// The source epub is copied as the finished marker.
+	if fi, err := os.Stat(filepath.Join(bookDir, "Fixture Book.epub")); err != nil || fi.Size() == 0 {
+		t.Errorf("finished epub missing: %v", err)
+	}
+	// Nothing left behind in the work directory.
+	if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), "audiobookconverter", "*", "Fixture Book", "*.wav")); len(leftovers) > 0 {
+		t.Errorf("wav files left behind: %v", leftovers)
+	}
 }
 
 // The copy of the epub in the output folder is the marker of a finished book:
 // nothing may be written there before the audio arrived.
 func TestIncompleteBookIsNotMarkedConverted(t *testing.T) {
-	cfg, src, out, fixture := endToEndFixture(t)
-
 	tests := []struct {
 		name    string
 		spoiler func(bookDir string)
-		env     string
+		flake   bool // the engine gives up after the first segment
 	}{
 		{
-			name: "audiblez dies after the first chapter",
-			env:  "1",
+			name:  "the engine dies after the first segment",
+			flake: true,
 		},
 		{
 			name: "the audio cannot be written to the output folder",
@@ -306,15 +233,16 @@ func TestIncompleteBookIsNotMarkedConverted(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			cfg, src, out, fixture, eng, fake := endToEndFixture(t)
+			if tc.flake {
+				fake.stopAfter = 1
+			}
 			bookDir := filepath.Join(out, "Fixture Book")
 			if tc.spoiler != nil {
 				tc.spoiler(bookDir)
 			}
-			if tc.env != "" {
-				t.Setenv("FAKE_STOP_AFTER", tc.env)
-			}
 			b := &Book{EpubPath: fixture, BookName: "Fixture Book.epub", SourceFolder: src}
-			if err := convertBook(b, cfg); err == nil {
+			if err := convertBook(b, cfg, eng); err == nil {
 				t.Fatal("convertBook reported success")
 			}
 			if _, err := os.Stat(filepath.Join(bookDir, "Fixture Book.epub")); err == nil {

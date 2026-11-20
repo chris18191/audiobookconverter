@@ -12,8 +12,9 @@ set -euo pipefail
 
 image="${ABC_IMAGE:-audiobookconverter:local}"
 output="$PWD"
-cache_volume="${ABC_CACHE_VOLUME:-audiobookconverter-models}"
-voice=""
+model="${ABC_MODEL_DIR:-}"
+speaker=""
+tts_url=""
 bitrate=""
 speed=""
 keep_patterns=""
@@ -35,11 +36,14 @@ Options:
                          $image)
       --build            build the image from the repository of this script
                          before converting
-  -c, --cache-volume NAME
-                         docker volume that keeps the speech model between
-                         runs (default: $cache_volume; without it every
-                         run downloads the model again)
-  -v, --voice VOICE      piper voice, e.g. bm_lewis (default: the image's)
+  -m, --model DIR        host folder holding the Qwen3-TTS model (the files
+                         next to its config.json); mounted read-only into the
+                         container (default: \$ABC_MODEL_DIR)
+      --tts-url URL      use an engine server that is already running instead
+                         of starting one in the container; then no model
+                         folder is needed
+      --speaker NAME     engine speaker (narrator voice), e.g. vivian
+                         (default: the converter's)
   -b, --bitrate BITRATE  AAC bitrate of the .m4b, e.g. 128k (default: the image's)
   -s, --speed FACT       speech rate between 0.5 and 2.0
       --keep-regex RE    rescue chapters whose title matches a skip pattern
@@ -48,6 +52,9 @@ Options:
   -t, --timeout SECONDS  give up after this many seconds (default: wait)
   -n, --dry-run          print the docker command and exit
   -h, --help             this text
+
+The model weights are not part of the image: point --model (or ABC_MODEL_DIR)
+at the folder holding them, or --tts-url at a running engine server.
 
 The files are written by the user of the container (root), so they may end up
 owned by root on the host.
@@ -64,8 +71,9 @@ while [[ $# -gt 0 ]]; do
 	-o | --output) [[ $# -ge 2 ]] || die "$1 needs an argument"; output="$2"; shift 2 ;;
 	-i | --image) [[ $# -ge 2 ]] || die "$1 needs an argument"; image="$2"; shift 2 ;;
 	--build) build=true; shift ;;
-	-c | --cache-volume) [[ $# -ge 2 ]] || die "$1 needs an argument"; cache_volume="$2"; shift 2 ;;
-	-v | --voice) [[ $# -ge 2 ]] || die "$1 needs an argument"; voice="$2"; shift 2 ;;
+	-m | --model) [[ $# -ge 2 ]] || die "$1 needs an argument"; model="$2"; shift 2 ;;
+	--tts-url) [[ $# -ge 2 ]] || die "$1 needs an argument"; tts_url="$2"; shift 2 ;;
+	--speaker) [[ $# -ge 2 ]] || die "$1 needs an argument"; speaker="$2"; shift 2 ;;
 	-b | --bitrate) [[ $# -ge 2 ]] || die "$1 needs an argument"; bitrate="$2"; shift 2 ;;
 	-s | --speed) [[ $# -ge 2 ]] || die "$1 needs an argument"; speed="$2"; shift 2 ;;
 	--keep-regex) [[ $# -ge 2 ]] || die "$1 needs an argument"; keep_patterns="$2"; shift 2 ;;
@@ -83,6 +91,11 @@ done
 [[ ${#epubs[@]} -gt 0 ]] || die "no epub given (try --help)"
 [[ "$attempts" =~ ^[0-9]+$ ]] || die "--attempts must be a number"
 [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
+if [[ -z "$tts_url" ]]; then
+	[[ -n "$model" ]] || die "no model folder: use --model DIR or --tts-url (see --help)"
+	[[ -f "$model/config.json" ]] || die "no config.json in model folder '$model'"
+	model="$(readlink -f -- "$model")"
+fi
 
 for f in "${epubs[@]}"; do
 	[[ -f "$f" ]] || die "no such file: $f"
@@ -123,17 +136,18 @@ fi
 
 run=(docker run -d --label audiobookconverter.one-shot=1
 	-v "$output:/audiobooks"
-	-v "$cache_volume:/root/.cache"
 	-e CONVERTER_IN=/books
 	-e CONVERTER_OUT=/audiobooks
 	-e CONVERTER_MAX_ATTEMPTS="$attempts"
 	-e CONVERTER_POLL_MINUTES=1)
+if [[ -n "$model" ]]; then run+=(-v "$model:/models:ro"); fi
+if [[ -n "$tts_url" ]]; then run+=(-e CONVERTER_TTS_URL="$tts_url"); fi
 i=1
 for f in "${pending[@]}"; do
 	run+=(-v "$(dirname -- "$f"):/books/$i:ro")
 	i=$((i + 1))
 done
-if [[ -n "$voice" ]]; then run+=(-e CONVERTER_VOICE="$voice"); fi
+if [[ -n "$speaker" ]]; then run+=(-e CONVERTER_TTS_SPEAKER="$speaker"); fi
 if [[ -n "$bitrate" ]]; then run+=(-e CONVERTER_BITRATE="$bitrate"); fi
 if [[ -n "$speed" ]]; then run+=(-e CONVERTER_SPEED="$speed"); fi
 if [[ -n "$keep_patterns" ]]; then run+=(-e CONVERTER_KEEP_PATTERNS="$keep_patterns"); fi
