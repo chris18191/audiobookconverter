@@ -36,9 +36,10 @@ Options:
                          $image)
       --build            build the image from the repository of this script
                          before converting
-  -m, --model DIR        host folder for the Qwen3-TTS model; an empty or
-                         missing folder is filled by the converter's first
-                         run (default: \$ABC_MODEL_DIR)
+  -m, --model DIR        host folder with a different Qwen3-TTS model; an
+                         empty or missing folder is filled by the
+                         converter's first run (default: \$ABC_MODEL_DIR; the
+                         image itself ships the 0.6 B model)
       --tts-url URL      use an engine server that is already running instead
                          of starting one in the container; then no model
                          folder is needed
@@ -53,10 +54,10 @@ Options:
   -n, --dry-run          print the docker command and exit
   -h, --help             this text
 
-The model weights are not part of the image. Without --model and --tts-url
-the converter downloads them on first use into the named volume
-audiobookconverter-models (override with ABC_MODELS_VOLUME), so the first
-conversion needs internet and every later one works offline.
+The model weights are not part of this script's concern: the image ships the
+default 0.6 B model. Use --model only for a different one (an empty folder is
+filled by the converter's first run), --tts-url for an engine server that runs
+elsewhere.
 
 The files are written by the user of the container (root), so they may end up
 owned by root on the host.
@@ -144,10 +145,8 @@ if [[ -n "$tts_url" ]]; then
 	run+=(-e CONVERTER_TTS_URL="$tts_url")
 elif [[ -n "$model" ]]; then
 	run+=(-v "$model:/models" -e CONVERTER_TTS_MODEL=/models)
-else
-	# no model folder: keep the auto-download out of the container filesystem
-	run+=(-v "${ABC_MODELS_VOLUME:-audiobookconverter-models}:/root/.cache/qwen3-tts")
 fi
+# else: the image's baked model serves the run
 i=1
 for f in "${pending[@]}"; do
 	run+=(-v "$(dirname -- "$f"):/books/$i:ro")

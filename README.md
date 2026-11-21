@@ -74,7 +74,7 @@ Escaping in the pattern lists: write `\,` for a comma inside a regexp.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CONVERTER_TTS_BIN` | `qwen_tts` | The engine executable (a bare name must be on the `PATH`) |
-| `CONVERTER_TTS_MODEL` | user cache | Model directory with `config.json`; when it does not hold a model yet, `TTS_MODEL_ID` is downloaded into it (default `~/.cache/qwen3-tts/<model>`) |
+| `CONVERTER_TTS_MODEL` | user cache | Model directory with `config.json`; when it does not hold a model yet, `TTS_MODEL_ID` is downloaded into it (default `~/.cache/qwen3-tts/<model>`; the Docker image ships the 0.6 B model under `/opt/models`) |
 | `CONVERTER_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Hugging Face repository fetched on first use; `0.6B-CustomVoice`, `1.7B-CustomVoice`, `1.7B-VoiceDesign`, `0.6B-Base`, `1.7B-Base` all work |
 | `CONVERTER_TTS_URL` | - | Use a running engine server (`http://host:port`) instead of starting one |
 | `CONVERTER_TTS_SPEAKER` | `ryan` | Narrator voice (`qwen_tts -d <model> --list-speakers`) |
@@ -110,9 +110,10 @@ sounds like one recording; the configured silence fills the gaps.
 executable (build it from the
 [engine repository](https://github.com/gabriele-mastrapasqua/qwen3-tts) with
 `make qwen_tts`, it needs gcc and OpenBLAS headers). The model weights are
-fetched from Hugging Face automatically on the first run (~1.1 GB for the
+fetched from Hugging Face automatically on the first run (~2.4 GB for the
 0.6 B model into `~/.cache/qwen3-tts/`, resumable) - afterwards the whole
-pipeline runs offline. If the engine was built against a private OpenBLAS,
+pipeline runs offline. The Docker image ships this model already, so
+containers need neither. If the engine was built against a private OpenBLAS,
 start the converter with that library on `LD_LIBRARY_PATH`, the child
 processes inherit it.
 
@@ -140,24 +141,25 @@ marker appears next to it.
 
 ## Docker
 
-The image builds the converter and the engine from source; the model weights
-are never part of the image. Give the container a volume for the user cache
-and the first run downloads the model into it (~1.1 GB, needs internet; every
-later run is offline):
+The image builds the converter and the engine from source and ships the
+default 0.6 B model inside it, so a container converts out of the box - no
+volume, no download. CI publishes it to
+`ghcr.io/chris18191/audiobookconverter:latest` on every push to `main`.
 
 ```bash
 docker build -t audiobookconverter .
 docker run -d --name audiobookconverter \
   -v /path/to/books:/books:ro \
   -v /path/to/audiobooks:/audiobooks \
-  -v audiobookconverter-models:/root/.cache/qwen3-tts \
   -e CONVERTER_IN=/books -e CONVERTER_OUT=/audiobooks \
   audiobookconverter
 ```
 
-An already downloaded model folder can be mounted anywhere and selected with
-`CONVERTER_TTS_MODEL` (or `CONVERTER_TTS_URL` points at an engine server
-elsewhere).
+A different model: mount its folder and set `CONVERTER_TTS_MODEL` (the mount
+may start empty, the converter downloads into it), point
+`CONVERTER_TTS_URL` at an engine server elsewhere, or rebuild with
+`--build-arg QWEN_TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` to bake
+another default (~5 GB).
 
 The engine image pins the engine commit: the wrapper speaks this exact server
 contract, so an upstream change is only taken after the test suite has been

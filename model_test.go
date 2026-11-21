@@ -154,8 +154,8 @@ func TestModelCacheDirSeparatesModels(t *testing.T) {
 // loadConfig must not pay for a download just to answer --help style checks;
 // with an external server URL the model folder is irrelevant.
 func TestEnsureModelSizeHint(t *testing.T) {
-	if !strings.Contains(modelSizeHint("Qwen/Qwen3-TTS-12Hz-1.7B-Base"), "4") ||
-		!strings.Contains(modelSizeHint(defaultTTSModelID), "1.1") {
+	if !strings.Contains(modelSizeHint("Qwen/Qwen3-TTS-12Hz-1.7B-Base"), "5") ||
+		!strings.Contains(modelSizeHint(defaultTTSModelID), "2.4") {
 		t.Error("size hints must name the model tier")
 	}
 }

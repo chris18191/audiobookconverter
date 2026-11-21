@@ -110,9 +110,9 @@ func ensureModel(dir, modelID string) error {
 // modelSizeHint only feeds the log line before the download starts.
 func modelSizeHint(repo string) string {
 	if strings.Contains(repo, "1.7B") {
-		return "about 4 GB"
+		return "about 5 GB"
 	}
-	return "about 1.1 GB"
+	return "about 2.4 GB"
 }
 
 // downloadModelFile fetches one repository file into dest unless dest already
