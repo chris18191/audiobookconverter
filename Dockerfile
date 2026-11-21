@@ -11,6 +11,9 @@ RUN CGO_ENABLED=0 go build -o /audiobookconverter .
 # exact server contract, and an unannounced change upstream turns into failed
 # conversions. Bumping it is a deliberate commit, checked against the test
 # suite before the image takes it.
+# SIMD=portable (AVX2+FMA, any x86 since 2013): without it the engine detects
+# the BUILD machine's ISA and the image SIGILLs on weaker CPUs at startup.
+# For a machine without even AVX2 build with SIMD=scalar.
 FROM debian:bookworm-slim AS engine
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential git ca-certificates libopenblas-dev \
@@ -19,7 +22,7 @@ ARG QWEN_TTS_COMMIT=ef339be58a778b062e1c14382347964552eae007
 RUN git clone https://github.com/gabriele-mastrapasqua/qwen3-tts /engine \
     && cd /engine \
     && git checkout "$QWEN_TTS_COMMIT" \
-    && make -j"$(nproc)" qwen_tts
+    && make -j"$(nproc)" qwen_tts SIMD=portable
 
 # The default speech model ships inside the image (~2.4 GB, fetched from
 # Hugging Face at build time). The ARG allows rebuilds with a different
