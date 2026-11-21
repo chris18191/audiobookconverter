@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -78,6 +77,7 @@ type config struct {
 	// the per-request rate.
 	TTSBin       string // path of the qwen_tts executable
 	TTSModelDir  string // model directory with config.json + model.safetensors
+	TTSModelID   string // Hugging Face repository to download when TTSModelDir is empty
 	TTSURL       string // existing engine server; empty = start one from TTSBin
 	TTSSpeaker   string // narrator voice, see `qwen_tts --list-speakers`
 	TTSQuantize  string // "" = full precision, "int8", "mixed-cpu" (startup flag)
@@ -109,6 +109,7 @@ func defaultConfig() config {
 
 		TTSBin:       defaultTTSBin,
 		TTSModelDir:  "",
+		TTSModelID:   defaultTTSModelID,
 		TTSURL:       "",
 		TTSSpeaker:   defaultTTSSpeaker,
 		TTSQuantize:  defaultTTSQuantize,
@@ -136,6 +137,7 @@ func loadConfig() config {
 	viper.SetDefault("poll_minutes", int(base.PollInterval.Minutes()))
 	viper.SetDefault("tts_bin", base.TTSBin)
 	viper.SetDefault("tts_model", base.TTSModelDir)
+	viper.SetDefault("tts_model_id", base.TTSModelID)
 	viper.SetDefault("tts_url", base.TTSURL)
 	viper.SetDefault("tts_startup_seconds", base.TTSStartup)
 	viper.SetDefault("tts_speaker", base.TTSSpeaker)
@@ -158,6 +160,7 @@ func loadConfig() config {
 
 		TTSBin:       viper.GetString("tts_bin"),
 		TTSModelDir:  viper.GetString("tts_model"),
+		TTSModelID:   viper.GetString("tts_model_id"),
 		TTSURL:       viper.GetString("tts_url"),
 		TTSSpeaker:   viper.GetString("tts_speaker"),
 		TTSQuantize:  strings.ToLower(viper.GetString("tts_quantize")),
@@ -175,6 +178,15 @@ func loadConfig() config {
 	}
 	if cfg.FolderOut == "" {
 		cfg.FolderOut = os.Getenv("FOLDER_OUT")
+	}
+	// No model folder given: models live in the user cache, below a name that
+	// tells the repositories apart.
+	if cfg.TTSModelDir == "" {
+		dir, err := modelCacheDir(cfg.TTSModelID)
+		if err != nil {
+			log.Fatalf("Error: could not locate a user cache folder: %v", err)
+		}
+		cfg.TTSModelDir = dir
 	}
 	if cfg.Speed < 0.5 || cfg.Speed > 2.0 {
 		log.Printf("Ignoring speed %v, must be between 0.5 and 2.0", cfg.Speed)
@@ -248,10 +260,6 @@ func loadConfig() config {
 		if _, err := exec.LookPath(cfg.TTSBin); err != nil {
 			log.Fatalf("Error: could not find the '%s' executable: %v", cfg.TTSBin, err)
 		}
-		if fi, err := os.Stat(filepath.Join(cfg.TTSModelDir, "config.json")); err != nil || !fi.Mode().IsRegular() {
-			log.Fatalf("Error: %s_TTS_MODEL: no config.json in %q - point it at a downloaded model directory",
-				ENV_PREFIX, cfg.TTSModelDir)
-		}
 		switch cfg.TTSQuantize {
 		case "", "int8", "mixed-cpu":
 		default:
@@ -261,6 +269,17 @@ func loadConfig() config {
 	}
 	if err := os.MkdirAll(cfg.FolderOut, 0o755); err != nil {
 		log.Fatalf("Error: could not create %s_OUT: %v", ENV_PREFIX, err)
+	}
+	// Fetch the model when it is not there yet - after the cheap checks, so
+	// that a misconfigured folder does not cost a gigabyte download first.
+	if cfg.TTSURL == "" {
+		if err := ensureModel(cfg.TTSModelDir, cfg.TTSModelID); err != nil {
+			log.Fatalf("Error: model is not available: %v\n"+
+				"  Point %s_TTS_MODEL at a downloaded model directory, set\n"+
+				"  %s_TTS_MODEL_ID to the repository to fetch, or %s_TTS_URL at a\n"+
+				"  running engine server.",
+				err, ENV_PREFIX, ENV_PREFIX, ENV_PREFIX)
+		}
 	}
 	log.Println("All checks passed. Starting...")
 	return cfg

@@ -31,8 +31,9 @@ COPY --from=converter /audiobookconverter /opt/
 
 ENV FOLDER_IN=/books
 ENV FOLDER_OUT=/audiobooks
-# The model weights are several gigabytes: they are never baked into the image
-# but mounted here (see convert-epub.sh --model).
-ENV CONVERTER_TTS_MODEL=/models
+# No CONVERTER_TTS_MODEL here: the converter downloads the model into the user
+# cache (/root/.cache/qwen3-tts) on first use. Mount a volume there to keep
+# the weights across containers, or set CONVERTER_TTS_MODEL + -v to an existing
+# model directory (see convert-epub.sh --model).
 
 CMD ["/opt/audiobookconverter"]

@@ -74,7 +74,8 @@ Escaping in the pattern lists: write `\,` for a comma inside a regexp.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CONVERTER_TTS_BIN` | `qwen_tts` | The engine executable (a bare name must be on the `PATH`) |
-| `CONVERTER_TTS_MODEL` | - | Model directory with `config.json` (required unless `TTS_URL` is set) |
+| `CONVERTER_TTS_MODEL` | user cache | Model directory with `config.json`; when it does not hold a model yet, `TTS_MODEL_ID` is downloaded into it (default `~/.cache/qwen3-tts/<model>`) |
+| `CONVERTER_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Hugging Face repository fetched on first use; `0.6B-CustomVoice`, `1.7B-CustomVoice`, `1.7B-VoiceDesign`, `0.6B-Base`, `1.7B-Base` all work |
 | `CONVERTER_TTS_URL` | - | Use a running engine server (`http://host:port`) instead of starting one |
 | `CONVERTER_TTS_SPEAKER` | `ryan` | Narrator voice (`qwen_tts -d <model> --list-speakers`) |
 | `CONVERTER_TTS_QUANTIZE` | `int8` | `int8` for a faster, smaller talker, `mixed-cpu` for the mixed-precision CPU build, empty for full precision |
@@ -108,10 +109,12 @@ sounds like one recording; the configured silence fills the gaps.
 `ffmpeg` and `ffprobe` must be on the `PATH`, plus the engine: the `qwen_tts`
 executable (build it from the
 [engine repository](https://github.com/gabriele-mastrapasqua/qwen3-tts) with
-`make qwen_tts`, it needs gcc and OpenBLAS headers) and a downloaded model
-directory. The engine runs completely offline. If it was built against a
-private OpenBLAS, start the converter with that library on `LD_LIBRARY_PATH`,
-the child processes inherit it.
+`make qwen_tts`, it needs gcc and OpenBLAS headers). The model weights are
+fetched from Hugging Face automatically on the first run (~1.1 GB for the
+0.6 B model into `~/.cache/qwen3-tts/`, resumable) - afterwards the whole
+pipeline runs offline. If the engine was built against a private OpenBLAS,
+start the converter with that library on `LD_LIBRARY_PATH`, the child
+processes inherit it.
 
 Model sizes: the 0.6 B model is the practical choice on a CPU-only machine
 (int8 measures at RTF ~1.1 on this laptop, a 10-hour novel converts
@@ -128,9 +131,7 @@ chapters with narration and dialogue, enough text to exercise segmentation:
 go build -o audiobookconverter .
 go run ./demo /tmp/books/demo-deutsch.epub
 
-CONVERTER_IN=/tmp/books CONVERTER_OUT=/tmp/audiobooks \
-CONVERTER_TTS_MODEL=/path/to/qwen3-tts-0.6b \
-./audiobookconverter
+CONVERTER_IN=/tmp/books CONVERTER_OUT=/tmp/audiobooks ./audiobookconverter
 ```
 
 The log shows the chapter selection, the detected language and per-chapter
@@ -140,20 +141,23 @@ marker appears next to it.
 ## Docker
 
 The image builds the converter and the engine from source; the model weights
-are several gigabytes and are never part of the image. Mount the folder that
-holds them at `/models` (or point `CONVERTER_TTS_URL` at an engine server
-elsewhere).
+are never part of the image. Give the container a volume for the user cache
+and the first run downloads the model into it (~1.1 GB, needs internet; every
+later run is offline):
 
 ```bash
 docker build -t audiobookconverter .
 docker run -d --name audiobookconverter \
   -v /path/to/books:/books:ro \
   -v /path/to/audiobooks:/audiobooks \
-  -v /path/to/models/qwen3-tts-0.6b:/models:ro \
+  -v audiobookconverter-models:/root/.cache/qwen3-tts \
   -e CONVERTER_IN=/books -e CONVERTER_OUT=/audiobooks \
-  -e CONVERTER_TTS_MODEL=/models \
   audiobookconverter
 ```
+
+An already downloaded model folder can be mounted anywhere and selected with
+`CONVERTER_TTS_MODEL` (or `CONVERTER_TTS_URL` points at an engine server
+elsewhere).
 
 The engine image pins the engine commit: the wrapper speaks this exact server
 contract, so an upstream change is only taken after the test suite has been
@@ -165,9 +169,9 @@ run against it.
 folder, shows the conversion log, and exits when every book is done:
 
 ```bash
-export ABC_MODEL_DIR=~/models/qwen3-tts-0.6b
 ./convert-epub.sh ~/Books/"The Secret Name.epub"
 ./convert-epub.sh -o ~/Audiobooks --speaker vivian --bitrate 128k ~/Books/*.epub
+ABC_MODEL_DIR=~/models/qwen3-tts-0.6b ./convert-epub.sh book.epub  # existing model folder
 ```
 
 The audiobooks appear in the output folder (`.` by default), one subfolder per

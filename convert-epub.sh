@@ -36,9 +36,9 @@ Options:
                          $image)
       --build            build the image from the repository of this script
                          before converting
-  -m, --model DIR        host folder holding the Qwen3-TTS model (the files
-                         next to its config.json); mounted read-only into the
-                         container (default: \$ABC_MODEL_DIR)
+  -m, --model DIR        host folder for the Qwen3-TTS model; an empty or
+                         missing folder is filled by the converter's first
+                         run (default: \$ABC_MODEL_DIR)
       --tts-url URL      use an engine server that is already running instead
                          of starting one in the container; then no model
                          folder is needed
@@ -53,8 +53,10 @@ Options:
   -n, --dry-run          print the docker command and exit
   -h, --help             this text
 
-The model weights are not part of the image: point --model (or ABC_MODEL_DIR)
-at the folder holding them, or --tts-url at a running engine server.
+The model weights are not part of the image. Without --model and --tts-url
+the converter downloads them on first use into the named volume
+audiobookconverter-models (override with ABC_MODELS_VOLUME), so the first
+conversion needs internet and every later one works offline.
 
 The files are written by the user of the container (root), so they may end up
 owned by root on the host.
@@ -91,9 +93,7 @@ done
 [[ ${#epubs[@]} -gt 0 ]] || die "no epub given (try --help)"
 [[ "$attempts" =~ ^[0-9]+$ ]] || die "--attempts must be a number"
 [[ "$timeout" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
-if [[ -z "$tts_url" ]]; then
-	[[ -n "$model" ]] || die "no model folder: use --model DIR or --tts-url (see --help)"
-	[[ -f "$model/config.json" ]] || die "no config.json in model folder '$model'"
+if [[ -n "$model" ]]; then
 	model="$(readlink -f -- "$model")"
 fi
 
@@ -140,8 +140,14 @@ run=(docker run -d --label audiobookconverter.one-shot=1
 	-e CONVERTER_OUT=/audiobooks
 	-e CONVERTER_MAX_ATTEMPTS="$attempts"
 	-e CONVERTER_POLL_MINUTES=1)
-if [[ -n "$model" ]]; then run+=(-v "$model:/models:ro"); fi
-if [[ -n "$tts_url" ]]; then run+=(-e CONVERTER_TTS_URL="$tts_url"); fi
+if [[ -n "$tts_url" ]]; then
+	run+=(-e CONVERTER_TTS_URL="$tts_url")
+elif [[ -n "$model" ]]; then
+	run+=(-v "$model:/models" -e CONVERTER_TTS_MODEL=/models)
+else
+	# no model folder: keep the auto-download out of the container filesystem
+	run+=(-v "${ABC_MODELS_VOLUME:-audiobookconverter-models}:/root/.cache/qwen3-tts")
+fi
 i=1
 for f in "${pending[@]}"; do
 	run+=(-v "$(dirname -- "$f"):/books/$i:ro")

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,10 +67,14 @@ func TestLoadConfigQwenOverrides(t *testing.T) {
 	for k, v := range qwenEnv(t) {
 		t.Setenv(k, v)
 	}
+	t.Setenv("CONVERTER_TTS_MODEL_ID", "1.7B-CustomVoice")
 	cfg := loadConfig()
 	if cfg.TTSSpeaker != "vivian" || cfg.TTSMaxChars != 800 || cfg.TTSSeed != 5 ||
 		cfg.TTSSilenceMS != 300 || cfg.TTSThreads != 3 || cfg.TTSLanguage != "German" {
 		t.Errorf("qwen options not picked up: %+v", cfg)
+	}
+	if cfg.TTSModelID != "1.7B-CustomVoice" {
+		t.Errorf("model id = %q", cfg.TTSModelID)
 	}
 }
 
@@ -84,6 +91,38 @@ func TestLoadConfigExternalServer(t *testing.T) {
 	cfg := loadConfig()
 	if cfg.TTSURL != "http://127.0.0.1:8080/" {
 		t.Errorf("engine URL = %q", cfg.TTSURL)
+	}
+}
+
+// Without CONVERTER_TTS_MODEL the model lives in the user cache and is
+// downloaded on first use into a directory named after the repository.
+func TestLoadConfigAutoDownloadLocation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/resolve/main/") {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer srv.Close()
+	old := modelBaseURL
+	modelBaseURL = srv.URL
+	defer func() { modelBaseURL = old }()
+
+	env := qwenEnv(t)
+	delete(env, "CONVERTER_TTS_MODEL")
+	for k, v := range env {
+		t.Setenv(k, v)
+	}
+	cache := filepath.Join(t.TempDir(), "cache")
+	t.Setenv("XDG_CACHE_HOME", cache)
+	cfg := loadConfig()
+	want := filepath.Join(cache, "qwen3-tts", "qwen3-tts-12hz-0.6b-customvoice")
+	if cfg.TTSModelDir != want {
+		t.Errorf("model dir = %q, want %q", cfg.TTSModelDir, want)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.TTSModelDir, "model.safetensors")); err != nil {
+		t.Errorf("loadConfig did not fetch the model: %v", err)
 	}
 }
 
